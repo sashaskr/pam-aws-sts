@@ -1,0 +1,25 @@
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: bootstrap
+
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.builder
+    volumes:
+      - .:/app
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/app/target
+    command: ["sleep", "infinity"]
+
+volumes:
+  cargo-cache:
+  target-cache:

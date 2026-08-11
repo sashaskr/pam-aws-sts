@@ -1,0 +1,8 @@
+/target
+*.so
+*.dylib
+.idea/
+
+# Real config contains account IDs — use .sample
+config/pam_aws_sts.toml
+config/pam_aws_sts.integration.toml

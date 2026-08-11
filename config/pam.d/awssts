@@ -1,0 +1,5 @@
+# PAM service configuration for AWS STS authentication
+# Install to: /etc/pam.d/awssts
+
+auth    required    pam_aws_sts.so    config=/etc/pam_aws_sts.toml
+account required    pam_aws_sts.so    config=/etc/pam_aws_sts.toml

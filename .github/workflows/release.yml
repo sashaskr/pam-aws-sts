@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            container: debian:bookworm
+            artifact: pam_aws_sts-linux-amd64
+            pam_path: /usr/lib/x86_64-linux-gnu/security
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            container: debian:bookworm
+            artifact: pam_aws_sts-linux-arm64
+            pam_path: /usr/lib/aarch64-linux-gnu/security
+            cross: true
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            container: amazonlinux:2023
+            artifact: pam_aws_sts-al2023-amd64
+            pam_path: /usr/lib64/security
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            container: rockylinux:9
+            artifact: pam_aws_sts-el9-amd64
+            pam_path: /usr/lib64/security
+
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps (Debian-based)
+        if: contains(matrix.container, 'debian') || contains(matrix.container, 'ubuntu')
+        run: |
+          apt-get update
+          apt-get install -y curl gcc libpam0g-dev pkg-config
+
+      - name: Install build deps (RHEL-based)
+        if: contains(matrix.container, 'amazonlinux') || contains(matrix.container, 'rockylinux')
+        run: |
+          yum install -y gcc pam-devel pkg-config perl-core
+
+      - name: Install cross-compile deps (ARM64)
+        if: matrix.cross
+        run: |
+          dpkg --add-architecture arm64
+          apt-get update
+          apt-get install -y gcc-aarch64-linux-gnu libpam0g-dev:arm64
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Add target (cross)
+        if: matrix.cross
+        run: |
+          source $HOME/.cargo/env
+          rustup target add ${{ matrix.target }}
+
+      - name: Configure cross linker
+        if: matrix.cross
+        run: |
+          mkdir -p .cargo
+          echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
+
+      - name: Build
+        run: |
+          source $HOME/.cargo/env
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Run tests
+        if: "!matrix.cross"
+        run: |
+          source $HOME/.cargo/env
+          cargo test --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: |
+          STRIP=strip
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            STRIP=aarch64-linux-gnu-strip
+          fi
+          $STRIP target/${{ matrix.target }}/release/libpam_aws_sts.so
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/libpam_aws_sts.so dist/pam_aws_sts.so
+          cp config/pam_aws_sts.toml.sample dist/
+          cp config/pam.d/awssts dist/
+          cp config/pg_hba.conf dist/
+          echo "PAM_MODULE_PATH=${{ matrix.pam_path }}" > dist/INSTALL_PATH
+          tar czf ${{ matrix.artifact }}.tar.gz -C dist .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz
+          generate_release_notes: true
