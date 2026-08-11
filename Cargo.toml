@@ -3,7 +3,7 @@ name = "pam_aws_sts"
 version = "0.1.0"
 edition = "2021"
 description = "PAM module for PostgreSQL authentication via AWS STS temporary credentials"
-license = "MIT"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["cdylib", "lib"]
