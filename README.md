@@ -1,5 +1,8 @@
 # pam_aws_sts
 
+[![CI](https://github.com/sashaskr/pam-aws-sts/actions/workflows/ci.yml/badge.svg)](https://github.com/sashaskr/pam-aws-sts/actions/workflows/ci.yml)
+[![Rust Report Card](https://rust-reportcard.xuri.me/badge/github.com/sashaskr/pam-aws-sts)](https://rust-reportcard.xuri.me/report/github.com/sashaskr/pam-aws-sts)
+
 A PAM module that authenticates PostgreSQL users with AWS STS temporary credentials.
 
 Any IAM identity that can produce valid STS credentials can authenticate to your self-managed PostgreSQL. The module calls `sts:GetCallerIdentity`, verifies the account and role, and maps it to a PostgreSQL username.
