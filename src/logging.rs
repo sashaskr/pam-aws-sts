@@ -1,6 +1,6 @@
 use log::LevelFilter;
-use syslog::{BasicLogger, Facility, Formatter3164};
 use std::sync::Once;
+use syslog::{BasicLogger, Facility, Formatter3164};
 
 static INIT: Once = Once::new();
 

@@ -47,7 +47,10 @@ impl StsCredentials {
         let remaining = expiration.signed_duration_since(now);
 
         if remaining.num_seconds() < 0 {
-            return Err(format!("credentials expired at {}", expiration.to_rfc3339()));
+            return Err(format!(
+                "credentials expired at {}",
+                expiration.to_rfc3339()
+            ));
         }
 
         if remaining.num_seconds() < grace_period_secs as i64 {
@@ -87,7 +90,10 @@ mod tests {
         }"#;
         let creds = StsCredentials::from_json(json).unwrap();
         assert_eq!(creds.access_key_id, "ASIAEXAMPLE");
-        assert_eq!(creds.secret_access_key, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        assert_eq!(
+            creds.secret_access_key,
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        );
         assert_eq!(creds.session_token, "FwoGZXIvYXdzEBYaDH");
         assert_eq!(creds.expiration.as_deref(), Some("2099-01-15T10:30:00Z"));
     }
@@ -101,7 +107,9 @@ mod tests {
 
     #[test]
     fn parse_malformed_json() {
-        assert!(StsCredentials::from_json("not json").unwrap_err().contains("invalid credential JSON"));
+        assert!(StsCredentials::from_json("not json")
+            .unwrap_err()
+            .contains("invalid credential JSON"));
     }
 
     #[test]
@@ -113,19 +121,25 @@ mod tests {
     #[test]
     fn parse_empty_access_key() {
         let json = r#"{"AccessKeyId":"","SecretAccessKey":"s","SessionToken":"t"}"#;
-        assert!(StsCredentials::from_json(json).unwrap_err().contains("AccessKeyId is empty"));
+        assert!(StsCredentials::from_json(json)
+            .unwrap_err()
+            .contains("AccessKeyId is empty"));
     }
 
     #[test]
     fn parse_empty_secret_key() {
         let json = r#"{"AccessKeyId":"a","SecretAccessKey":"","SessionToken":"t"}"#;
-        assert!(StsCredentials::from_json(json).unwrap_err().contains("SecretAccessKey is empty"));
+        assert!(StsCredentials::from_json(json)
+            .unwrap_err()
+            .contains("SecretAccessKey is empty"));
     }
 
     #[test]
     fn parse_empty_session_token() {
         let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":""}"#;
-        assert!(StsCredentials::from_json(json).unwrap_err().contains("SessionToken is empty"));
+        assert!(StsCredentials::from_json(json)
+            .unwrap_err()
+            .contains("SessionToken is empty"));
     }
 
     #[test]
@@ -139,7 +153,10 @@ mod tests {
     fn expiration_already_expired() {
         let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t","Expiration":"2020-01-01T00:00:00Z"}"#;
         let creds = StsCredentials::from_json(json).unwrap();
-        assert!(creds.check_expiration(30).unwrap_err().contains("expired at"));
+        assert!(creds
+            .check_expiration(30)
+            .unwrap_err()
+            .contains("expired at"));
     }
 
     #[test]
@@ -152,9 +169,13 @@ mod tests {
 
     #[test]
     fn expiration_invalid_format() {
-        let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t","Expiration":"nope"}"#;
+        let json =
+            r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t","Expiration":"nope"}"#;
         let creds = StsCredentials::from_json(json).unwrap();
-        assert!(creds.check_expiration(30).unwrap_err().contains("invalid expiration"));
+        assert!(creds
+            .check_expiration(30)
+            .unwrap_err()
+            .contains("invalid expiration"));
     }
 
     #[test]

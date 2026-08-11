@@ -44,7 +44,12 @@ pub fn authenticate(username: &str, password: &str, config_path: &str) -> AuthRe
         }
     };
 
-    log::debug!("identity for '{}': account={}, arn={}", username, identity.account, identity.arn);
+    log::debug!(
+        "identity for '{}': account={}, arn={}",
+        username,
+        identity.account,
+        identity.arn
+    );
 
     match validate_identity(username, &identity, &config) {
         Ok(()) => {

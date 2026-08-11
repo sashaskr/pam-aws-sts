@@ -36,7 +36,11 @@ facility = "auth"
 #[test]
 fn test_garbage_password_returns_invalid_credentials() {
     let config_file = write_config(VALID_CONFIG);
-    let result = authenticate("pg_admin", "not-json-at-all", config_file.path().to_str().unwrap());
+    let result = authenticate(
+        "pg_admin",
+        "not-json-at-all",
+        config_file.path().to_str().unwrap(),
+    );
     assert!(matches!(result, AuthResult::InvalidCredentials(_)));
 }
 

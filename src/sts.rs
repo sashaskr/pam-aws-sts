@@ -97,7 +97,10 @@ impl StsClient {
         for (name, value) in request.headers() {
             headers.push((
                 name.as_str().to_string(),
-                value.to_str().map_err(|e| format!("header encoding error: {}", e))?.to_string(),
+                value
+                    .to_str()
+                    .map_err(|e| format!("header encoding error: {}", e))?
+                    .to_string(),
             ));
         }
 
@@ -124,7 +127,11 @@ impl StsClient {
             .map_err(|e| format!("failed to read response: {}", e))?;
 
         if status != 200 {
-            return Err(format!("STS HTTP {}: {}", status, truncate(&response_body, 200)));
+            return Err(format!(
+                "STS HTTP {}: {}",
+                status,
+                truncate(&response_body, 200)
+            ));
         }
 
         Ok(response_body)
@@ -149,7 +156,10 @@ fn parse_get_caller_identity_response(xml: &str) -> Result<CallerIdentity, Strin
                 current_element = String::from_utf8_lossy(e.name().as_ref()).to_string();
             }
             Ok(Event::Text(ref e)) => {
-                let text = e.unescape().map_err(|e| format!("XML decode error: {}", e))?.to_string();
+                let text = e
+                    .unescape()
+                    .map_err(|e| format!("XML decode error: {}", e))?
+                    .to_string();
                 match current_element.as_str() {
                     "Account" => account = Some(text),
                     "Arn" => arn = Some(text),
@@ -171,7 +181,11 @@ fn parse_get_caller_identity_response(xml: &str) -> Result<CallerIdentity, Strin
 }
 
 fn truncate(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len { s } else { &s[..max_len] }
+    if s.len() <= max_len {
+        s
+    } else {
+        &s[..max_len]
+    }
 }
 
 #[cfg(test)]
@@ -190,7 +204,10 @@ mod tests {
 </GetCallerIdentityResponse>"#;
         let id = parse_get_caller_identity_response(xml).unwrap();
         assert_eq!(id.account, "111122223333");
-        assert_eq!(id.arn, "arn:aws:sts::111122223333:assumed-role/MyRole/session");
+        assert_eq!(
+            id.arn,
+            "arn:aws:sts::111122223333:assumed-role/MyRole/session"
+        );
         assert_eq!(id.user_id, "AROAEXAMPLE:session");
     }
 
@@ -200,7 +217,9 @@ mod tests {
     <Arn>arn:aws:sts::111122223333:assumed-role/R/s</Arn>
     <UserId>U:s</UserId>
   </GetCallerIdentityResult></GetCallerIdentityResponse>"#;
-        assert!(parse_get_caller_identity_response(xml).unwrap_err().contains("missing Account"));
+        assert!(parse_get_caller_identity_response(xml)
+            .unwrap_err()
+            .contains("missing Account"));
     }
 
     #[test]
@@ -209,7 +228,9 @@ mod tests {
     <UserId>U:s</UserId>
     <Account>111122223333</Account>
   </GetCallerIdentityResult></GetCallerIdentityResponse>"#;
-        assert!(parse_get_caller_identity_response(xml).unwrap_err().contains("missing Arn"));
+        assert!(parse_get_caller_identity_response(xml)
+            .unwrap_err()
+            .contains("missing Arn"));
     }
 
     #[test]
@@ -218,12 +239,15 @@ mod tests {
     <Arn>arn:aws:sts::111122223333:assumed-role/R/s</Arn>
     <Account>111122223333</Account>
   </GetCallerIdentityResult></GetCallerIdentityResponse>"#;
-        assert!(parse_get_caller_identity_response(xml).unwrap_err().contains("missing UserId"));
+        assert!(parse_get_caller_identity_response(xml)
+            .unwrap_err()
+            .contains("missing UserId"));
     }
 
     #[test]
     fn parse_error_response() {
-        let xml = r#"<ErrorResponse><Error><Code>ExpiredTokenException</Code></Error></ErrorResponse>"#;
+        let xml =
+            r#"<ErrorResponse><Error><Code>ExpiredTokenException</Code></Error></ErrorResponse>"#;
         assert!(parse_get_caller_identity_response(xml).is_err());
     }
 

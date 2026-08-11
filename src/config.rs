@@ -59,8 +59,8 @@ impl Config {
             return Err(format!("config file not found: {}", path.display()));
         }
 
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("failed to read config: {}", e))?;
+        let content =
+            fs::read_to_string(path).map_err(|e| format!("failed to read config: {}", e))?;
 
         Self::from_str(&content)
     }
@@ -117,7 +117,10 @@ facility = "auth"
         assert_eq!(config.aws.allowed_account_ids, vec!["111122223333"]);
         assert_eq!(config.aws.timeout_secs, 5);
         assert_eq!(config.aws.grace_period_secs, Some(30));
-        assert_eq!(config.role_mapping.get("YubiKeyKMSRole").unwrap(), &vec!["pg_admin".to_string()]);
+        assert_eq!(
+            config.role_mapping.get("YubiKeyKMSRole").unwrap(),
+            &vec!["pg_admin".to_string()]
+        );
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.facility, "auth");
     }
@@ -125,7 +128,10 @@ facility = "auth"
     #[test]
     fn sts_endpoint_default() {
         let config = Config::from_str(VALID_CONFIG).unwrap();
-        assert_eq!(config.sts_endpoint(), "https://sts.eu-central-1.amazonaws.com");
+        assert_eq!(
+            config.sts_endpoint(),
+            "https://sts.eu-central-1.amazonaws.com"
+        );
     }
 
     #[test]
@@ -153,7 +159,9 @@ allowed_account_ids = ["111122223333"]
 [role_mapping]
 "R" = ["u"]
 "#;
-        assert!(Config::from_str(toml).unwrap_err().contains("region must not be empty"));
+        assert!(Config::from_str(toml)
+            .unwrap_err()
+            .contains("region must not be empty"));
     }
 
     #[test]
@@ -166,7 +174,9 @@ allowed_account_ids = []
 [role_mapping]
 "R" = ["u"]
 "#;
-        assert!(Config::from_str(toml).unwrap_err().contains("allowed_account_ids"));
+        assert!(Config::from_str(toml)
+            .unwrap_err()
+            .contains("allowed_account_ids"));
     }
 
     #[test]
@@ -211,8 +221,14 @@ allowed_account_ids = ["111122223333", "444455556666"]
 "#;
         let config = Config::from_str(toml).unwrap();
         assert_eq!(config.aws.allowed_account_ids.len(), 2);
-        assert_eq!(config.role_mapping.get("AdminRole").unwrap(), &vec!["admin".to_string(), "superuser".to_string()]);
-        assert_eq!(config.role_mapping.get("ViewerRole").unwrap(), &vec!["viewer".to_string()]);
+        assert_eq!(
+            config.role_mapping.get("AdminRole").unwrap(),
+            &vec!["admin".to_string(), "superuser".to_string()]
+        );
+        assert_eq!(
+            config.role_mapping.get("ViewerRole").unwrap(),
+            &vec!["viewer".to_string()]
+        );
     }
 
     #[test]
@@ -231,7 +247,9 @@ allowed_account_ids = ["111122223333", "444455556666"]
 
     #[test]
     fn load_nonexistent_file() {
-        assert!(Config::load("/no/such/path.toml").unwrap_err().contains("not found"));
+        assert!(Config::load("/no/such/path.toml")
+            .unwrap_err()
+            .contains("not found"));
     }
 
     #[test]

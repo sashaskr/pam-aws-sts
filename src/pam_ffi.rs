@@ -44,11 +44,7 @@ struct PamConv {
 }
 
 extern "C" {
-    fn pam_get_item(
-        pamh: *const PamHandle,
-        item_type: c_int,
-        item: *mut *const c_void,
-    ) -> c_int;
+    fn pam_get_item(pamh: *const PamHandle, item_type: c_int, item: *mut *const c_void) -> c_int;
 }
 
 unsafe fn get_pam_item_str(pamh: *const PamHandle, item_type: c_int) -> Result<String, c_int> {
