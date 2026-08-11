@@ -2,7 +2,7 @@ use crate::logging::PamLogger;
 use crate::{authenticate, AuthResult};
 use libc::{c_char, c_int, c_void, free};
 use std::ffi::{CStr, CString};
-use std::ptr;
+use std::ptr::{self, NonNull};
 use zeroize::Zeroize;
 
 const PAM_SUCCESS: c_int = 0;
@@ -66,8 +66,12 @@ unsafe fn get_password_via_conv(pamh: *const PamHandle) -> Result<String, c_int>
         return Err(PAM_CRED_INSUFFICIENT);
     }
 
-    let conv = &*(conv_ptr as *const PamConv);
-    let conv_fn = conv.conv.ok_or(PAM_CRED_INSUFFICIENT)?;
+    // SAFETY: pam_get_item returned PAM_SUCCESS with a non-null pointer.
+    // The PAM API guarantees this points to a valid pam_conv struct owned
+    // by the PAM framework for the lifetime of this call.
+    let conv_nn = NonNull::new(conv_ptr as *mut PamConv).ok_or(PAM_CRED_INSUFFICIENT)?;
+    let conv_fn = (*conv_nn.as_ptr()).conv.ok_or(PAM_CRED_INSUFFICIENT)?;
+    let appdata = (*conv_nn.as_ptr()).appdata_ptr;
 
     let prompt = CString::new("Password: ").map_err(|_| PAM_AUTH_ERR)?;
     let msg = PamMessage {
@@ -81,30 +85,31 @@ unsafe fn get_password_via_conv(pamh: *const PamHandle) -> Result<String, c_int>
         1,
         &msg_ptr as *const _ as *mut *const PamMessage,
         &mut resp_ptr,
-        conv.appdata_ptr,
+        appdata,
     );
 
     if ret != PAM_SUCCESS || resp_ptr.is_null() {
         return Err(PAM_CRED_INSUFFICIENT);
     }
 
-    // Copy the response struct out and free the allocation immediately
-    let resp = ptr::read(resp_ptr);
+    // SAFETY: conv_fn returned PAM_SUCCESS with a non-null resp_ptr.
+    // The response was allocated by the PAM conversation function; we own it.
+    let resp_nn = NonNull::new(resp_ptr).ok_or(PAM_CRED_INSUFFICIENT)?;
+    let resp_resp = (*resp_nn.as_ptr()).resp;
     free(resp_ptr as *mut c_void);
 
-    if resp.resp.is_null() {
+    if resp_resp.is_null() {
         return Err(PAM_CRED_INSUFFICIENT);
     }
 
-    let password = CStr::from_ptr(resp.resp)
+    let password = CStr::from_ptr(resp_resp)
         .to_str()
         .map(|s| s.to_string())
         .map_err(|_| PAM_AUTH_ERR)?;
 
-    // Zero out the C-allocated password before freeing
-    let resp_len = libc::strlen(resp.resp);
-    ptr::write_bytes(resp.resp as *mut u8, 0, resp_len);
-    free(resp.resp as *mut c_void);
+    let resp_len = libc::strlen(resp_resp);
+    ptr::write_bytes(resp_resp as *mut u8, 0, resp_len);
+    free(resp_resp as *mut c_void);
 
     Ok(password)
 }
