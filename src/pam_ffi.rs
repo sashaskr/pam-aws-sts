@@ -88,9 +88,11 @@ unsafe fn get_password_via_conv(pamh: *const PamHandle) -> Result<String, c_int>
         return Err(PAM_CRED_INSUFFICIENT);
     }
 
-    let resp = &*resp_ptr;
+    // Copy the response struct out and free the allocation immediately
+    let resp = ptr::read(resp_ptr);
+    free(resp_ptr as *mut c_void);
+
     if resp.resp.is_null() {
-        free(resp_ptr as *mut c_void);
         return Err(PAM_CRED_INSUFFICIENT);
     }
 
@@ -102,9 +104,7 @@ unsafe fn get_password_via_conv(pamh: *const PamHandle) -> Result<String, c_int>
     // Zero out the C-allocated password before freeing
     let resp_len = libc::strlen(resp.resp);
     ptr::write_bytes(resp.resp as *mut u8, 0, resp_len);
-
     free(resp.resp as *mut c_void);
-    free(resp_ptr as *mut c_void);
 
     Ok(password)
 }
