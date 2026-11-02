@@ -30,6 +30,12 @@ Client (any STS credential source) → psql -U dbadmin (password = JSON creds)
         → PAM_SUCCESS or PAM_AUTH_ERR
 ```
 
+Note what this implies: the credentials you supply as the password are the real
+thing, not an identity-only token, so the database server can act as your IAM
+principal until the session expires. That tradeoff, and the alternative of
+sending a signed `GetCallerIdentity` request instead of the secret, are written
+up in [docs/design/credential-transport.md](docs/design/credential-transport.md).
+
 ## Getting credentials (client side)
 
 The module accepts any valid STS temporary credentials as the password. The JSON format:
@@ -199,6 +205,8 @@ scripts/
 ├── install.sh
 ├── test.sh
 └── pg-connect.sh
+docs/design/
+└── credential-transport.md  — why the server sees your secret, and what to do about it
 ```
 
 ## License
