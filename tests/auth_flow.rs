@@ -120,13 +120,44 @@ fn test_valid_creds_with_future_expiration_reaches_sts_call() {
 }
 
 #[test]
-fn test_config_with_mock_endpoint_reaches_sts() {
-    // Point at a non-existent mock endpoint — should fail with connection error
+fn test_plaintext_endpoint_without_opt_in_is_a_config_error() {
+    // A plaintext STS endpoint must fail closed at config load rather than
+    // being used: the identity decision comes from that endpoint's response.
     let config = r#"
 [aws]
 region = "eu-central-1"
 allowed_account_ids = ["111122223333"]
 sts_endpoint = "http://127.0.0.1:1"
+
+[role_mapping]
+"YubiKeyKMSRole" = ["pg_admin"]
+"#;
+    let config_file = write_config(config);
+    let json = r#"{
+        "AccessKeyId": "ASIATEST",
+        "SecretAccessKey": "testsecret",
+        "SessionToken": "testtoken",
+        "Expiration": "2099-12-31T23:59:59Z"
+    }"#;
+    let result = authenticate("pg_admin", json, config_file.path().to_str().unwrap());
+    assert!(
+        matches!(result, AuthResult::Error(_)),
+        "expected a configuration error, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_config_with_mock_endpoint_reaches_sts() {
+    // Point at a non-existent mock endpoint — should fail with connection error.
+    // allow_insecure_endpoint is required now that plaintext is rejected by
+    // default; this is exactly the local-testing case it exists for.
+    let config = r#"
+[aws]
+region = "eu-central-1"
+allowed_account_ids = ["111122223333"]
+sts_endpoint = "http://127.0.0.1:1"
+allow_insecure_endpoint = true
 timeout_secs = 1
 
 [role_mapping]

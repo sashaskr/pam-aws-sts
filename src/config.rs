@@ -20,6 +20,13 @@ pub struct AwsConfig {
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     pub grace_period_secs: Option<u64>,
+    /// Allows `sts_endpoint` to use plaintext `http://`.
+    ///
+    /// Intended only for a local mock such as LocalStack. The whole
+    /// authentication decision is derived from the endpoint's response, so
+    /// enabling this on a reachable network makes identity forgeable.
+    #[serde(default)]
+    pub allow_insecure_endpoint: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +59,44 @@ fn default_facility() -> String {
     "auth".into()
 }
 
+/// Rejects an `sts_endpoint` that would carry the identity decision in plaintext.
+///
+/// Every authentication outcome is derived from the XML this endpoint returns.
+/// Over plaintext HTTP an on-path attacker can substitute any `Account` and
+/// `Arn`, which authenticates them as any mapped PostgreSQL user. HTTPS is
+/// therefore a correctness requirement, not a preference, and it is enforced
+/// at config load so a bad value fails once at startup rather than silently on
+/// every login.
+fn validate_sts_endpoint(endpoint: &str, allow_insecure: bool) -> Result<(), String> {
+    if endpoint.starts_with("https://") {
+        return Ok(());
+    }
+
+    if !endpoint.starts_with("http://") {
+        return Err(format!(
+            "aws.sts_endpoint must start with https:// (got '{}')",
+            endpoint
+        ));
+    }
+
+    if !allow_insecure {
+        return Err(format!(
+            "aws.sts_endpoint '{}' uses plaintext http://. The authentication \
+             decision is derived entirely from this endpoint's response, so an \
+             on-path attacker could forge any identity. Use https://, or set \
+             aws.allow_insecure_endpoint = true if this is a local mock.",
+            endpoint
+        ));
+    }
+
+    log::warn!(
+        "aws.sts_endpoint '{}' is plaintext http:// and allow_insecure_endpoint \
+         is set; identity responses are forgeable. Do not use this outside testing.",
+        endpoint
+    );
+    Ok(())
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Self, String> {
         let path = Path::new(path);
@@ -77,6 +122,9 @@ impl Config {
         }
         if config.role_mapping.is_empty() {
             return Err("role_mapping must contain at least one mapping".into());
+        }
+        if let Some(endpoint) = &config.aws.sts_endpoint {
+            validate_sts_endpoint(endpoint, config.aws.allow_insecure_endpoint)?;
         }
 
         Ok(config)
@@ -135,7 +183,22 @@ facility = "auth"
     }
 
     #[test]
-    fn sts_endpoint_override() {
+    fn sts_endpoint_override_https() {
+        let toml = r#"
+[aws]
+region = "eu-central-1"
+allowed_account_ids = ["111122223333"]
+sts_endpoint = "https://sts.internal.example.com"
+
+[role_mapping]
+"SomeRole" = ["user1"]
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(config.sts_endpoint(), "https://sts.internal.example.com");
+    }
+
+    #[test]
+    fn plaintext_endpoint_rejected_by_default() {
         let toml = r#"
 [aws]
 region = "eu-central-1"
@@ -145,8 +208,76 @@ sts_endpoint = "http://localhost:4566"
 [role_mapping]
 "SomeRole" = ["user1"]
 "#;
+        let err = Config::from_str(toml).unwrap_err();
+        assert!(
+            err.contains("plaintext http://"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(err.contains("allow_insecure_endpoint"));
+    }
+
+    #[test]
+    fn plaintext_endpoint_allowed_with_explicit_opt_in() {
+        let toml = r#"
+[aws]
+region = "eu-central-1"
+allowed_account_ids = ["111122223333"]
+sts_endpoint = "http://localhost:4566"
+allow_insecure_endpoint = true
+
+[role_mapping]
+"SomeRole" = ["user1"]
+"#;
         let config = Config::from_str(toml).unwrap();
         assert_eq!(config.sts_endpoint(), "http://localhost:4566");
+    }
+
+    #[test]
+    fn non_http_scheme_rejected_even_with_opt_in() {
+        for endpoint in [
+            "file:///etc/passwd",
+            "ftp://example.com",
+            "sts.us-east-1.amazonaws.com",
+            "//sts.us-east-1.amazonaws.com",
+            "",
+        ] {
+            let toml = format!(
+                r#"
+[aws]
+region = "us-east-1"
+allowed_account_ids = ["111122223333"]
+sts_endpoint = "{}"
+allow_insecure_endpoint = true
+
+[role_mapping]
+"R" = ["u"]
+"#,
+                endpoint
+            );
+            let err = Config::from_str(&toml).unwrap_err();
+            assert!(
+                err.contains("must start with https://"),
+                "endpoint {:?} should be rejected, got: {}",
+                endpoint,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn opt_in_defaults_to_false() {
+        let config = Config::from_str(VALID_CONFIG).unwrap();
+        assert!(!config.aws.allow_insecure_endpoint);
+    }
+
+    // The default endpoint is derived from the region and is always https,
+    // so omitting sts_endpoint can never produce a plaintext call.
+    #[test]
+    fn derived_default_endpoint_is_https() {
+        let config = Config::from_str(VALID_CONFIG).unwrap();
+        assert!(config.aws.sts_endpoint.is_none());
+        assert!(config.sts_endpoint().starts_with("https://"));
     }
 
     #[test]
