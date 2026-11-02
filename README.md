@@ -180,12 +180,23 @@ docker compose up -d          # vanilla postgres + rust builder
 | | `allowed_account_ids` | Account IDs accepted (array) |
 | | `sts_endpoint` | Optional override. Must be `https://`. Omit to derive from `region` |
 | | `allow_insecure_endpoint` | Permit a plaintext `http://` endpoint. Local mocks only (default: false) |
-| | `timeout_secs` | HTTP timeout (default: 5) |
-| | `grace_period_secs` | Reject tokens expiring within this window (default: 30) |
+| | `timeout_secs` | HTTP timeout, 1–30 (default: 5) |
+| | `grace_period_secs` | Reject tokens expiring within this window (default: 30). Client-asserted; see note below |
+| | `require_expiration` | Reject credentials with no `Expiration` field (default: false) |
 | `[role_mapping."<account>"]` | `"RoleName" = ["pguser"]` | IAM role → allowed PG usernames, scoped by account. Required for multi-account setups |
 | `[role_mapping]` | `"RoleName" = ["pguser"]` | Flat form. Only valid with exactly one allowed account |
 | `[logging]` | `level` | debug, info, warn, error |
 | | `facility` | syslog facility |
+
+`Expiration` arrives in the same client-supplied payload as the credentials, so
+`grace_period_secs` can only be enforced when the field is present and a client
+may skip the check by omitting it. Real expiry is always enforced by STS. Set
+`require_expiration = true` to make the grace period binding.
+
+The config file must not be writable by group or other, and must be owned by
+root or by the user PostgreSQL runs as. It decides which IAM roles map to which
+database users, so write access to it is equivalent to granting database
+access. Loading refuses a file that fails those checks.
 
 ## Security
 
