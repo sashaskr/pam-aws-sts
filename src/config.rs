@@ -8,7 +8,6 @@ pub struct Config {
     pub aws: AwsConfig,
     pub role_mapping: RoleMapping,
     #[serde(default)]
-    #[allow(dead_code)]
     pub logging: LoggingConfig,
 }
 
@@ -70,7 +69,6 @@ pub struct AwsConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -91,12 +89,17 @@ fn default_timeout() -> u64 {
     5
 }
 
+/// Used until the config has been read, so that a config load failure is
+/// still reportable.
+pub const DEFAULT_LOG_LEVEL: &str = "info";
+pub const DEFAULT_LOG_FACILITY: &str = "auth";
+
 fn default_log_level() -> String {
-    "info".into()
+    DEFAULT_LOG_LEVEL.into()
 }
 
 fn default_facility() -> String {
-    "auth".into()
+    DEFAULT_LOG_FACILITY.into()
 }
 
 /// Rejects an `sts_endpoint` that would carry the identity decision in plaintext.
