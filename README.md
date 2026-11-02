@@ -162,7 +162,8 @@ docker compose up -d          # vanilla postgres + rust builder
 |---------|-----|-------------|
 | `[aws]` | `region` | AWS region for STS endpoint |
 | | `allowed_account_ids` | Account IDs accepted (array) |
-| | `sts_endpoint` | Optional override (for testing) |
+| | `sts_endpoint` | Optional override. Must be `https://`. Omit to derive from `region` |
+| | `allow_insecure_endpoint` | Permit a plaintext `http://` endpoint. Local mocks only (default: false) |
 | | `timeout_secs` | HTTP timeout (default: 5) |
 | | `grace_period_secs` | Reject tokens expiring within this window (default: 30) |
 | `[role_mapping]` | `"RoleName" = ["pguser"]` | IAM role → allowed PG usernames |

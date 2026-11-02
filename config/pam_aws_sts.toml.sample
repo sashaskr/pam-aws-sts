@@ -4,8 +4,16 @@
 [aws]
 region = "us-east-1"
 allowed_account_ids = ["123456789012"]
-# Optional: override STS endpoint (e.g. for localstack testing)
-# sts_endpoint = "http://localhost:4566"
+# Optional: override the STS endpoint. Must be https://.
+# Every authentication decision is derived from this endpoint's response, so a
+# plaintext endpoint lets an on-path attacker forge any identity. Omit this key
+# to use the regional endpoint derived from `region`, which is always https.
+# sts_endpoint = "https://sts.us-east-1.amazonaws.com"
+
+# Permits a plaintext http:// sts_endpoint. For a local mock (LocalStack) only.
+# Never set this on a host whose STS traffic crosses a network you do not own.
+# allow_insecure_endpoint = false
+
 timeout_secs = 5
 grace_period_secs = 30
 
