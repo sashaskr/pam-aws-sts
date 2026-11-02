@@ -112,6 +112,22 @@ Prerequisites: Linux server running PostgreSQL 16+ (compiled with `--with-pam`, 
    facility = "auth"
    ```
 
+   If you allow **more than one account**, scope the mapping by account. IAM
+   role names are unique only within an account, so a flat mapping would let a
+   role of the same name in any allowed account claim the same database user.
+   The flat form is rejected at load in that case:
+
+   ```toml
+   [aws]
+   allowed_account_ids = ["123456789012", "210987654321"]
+
+   [role_mapping."123456789012"]
+   "MyRole" = ["dbadmin"]
+
+   [role_mapping."210987654321"]
+   "MyRole" = ["readonly"]
+   ```
+
 4. **Create PostgreSQL roles** that match your mapping:
    ```sql
    CREATE ROLE dbadmin LOGIN;
@@ -166,7 +182,8 @@ docker compose up -d          # vanilla postgres + rust builder
 | | `allow_insecure_endpoint` | Permit a plaintext `http://` endpoint. Local mocks only (default: false) |
 | | `timeout_secs` | HTTP timeout (default: 5) |
 | | `grace_period_secs` | Reject tokens expiring within this window (default: 30) |
-| `[role_mapping]` | `"RoleName" = ["pguser"]` | IAM role → allowed PG usernames |
+| `[role_mapping."<account>"]` | `"RoleName" = ["pguser"]` | IAM role → allowed PG usernames, scoped by account. Required for multi-account setups |
+| `[role_mapping]` | `"RoleName" = ["pguser"]` | Flat form. Only valid with exactly one allowed account |
 | `[logging]` | `level` | debug, info, warn, error |
 | | `facility` | syslog facility |
 
