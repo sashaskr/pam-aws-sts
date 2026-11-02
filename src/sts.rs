@@ -190,12 +190,33 @@ fn parse_get_caller_identity_response(xml: &str) -> Result<CallerIdentity, Strin
                 text_buf.clear();
             }
             Ok(Event::Text(ref t)) => {
-                // Appended rather than assigned: a value can arrive as several
-                // text events when it contains entities.
+                // Appended rather than assigned: one element's value arrives
+                // as several events when it contains entity references.
+                //
+                // Text content is already literal here. quick-xml reports
+                // entity references as separate GeneralRef events, so
+                // unescaping this would be wrong as well as redundant.
                 let chunk = t
-                    .unescape()
+                    .xml10_content()
                     .map_err(|e| format!("XML decode error: {}", e))?;
                 text_buf.push_str(&chunk);
+            }
+            Ok(Event::GeneralRef(ref r)) => {
+                // `&#38;` and `&#x26;` resolve directly; the predefined named
+                // references (amp, lt, gt, quot, apos) go through unescape.
+                match r
+                    .resolve_char_ref()
+                    .map_err(|e| format!("XML character reference error: {}", e))?
+                {
+                    Some(ch) => text_buf.push(ch),
+                    None => {
+                        let name = r.decode().map_err(|e| format!("XML decode error: {}", e))?;
+                        let entity = format!("&{};", name);
+                        let resolved = quick_xml::escape::unescape(&entity)
+                            .map_err(|e| format!("unknown XML entity '{}': {}", entity, e))?;
+                        text_buf.push_str(&resolved);
+                    }
+                }
             }
             Ok(Event::CData(ref c)) => {
                 text_buf.push_str(&String::from_utf8_lossy(c.as_ref()));
@@ -454,6 +475,8 @@ mod tests {
         assert_eq!(id.arn, "arn:aws:sts::111122223333:assumed-role/R/s");
     }
 
+    // An entity reference splits one element's value across several parser
+    // events, so the value has to be accumulated rather than assigned.
     #[test]
     fn entity_escaped_value_is_reassembled() {
         let xml = wrap(
@@ -462,6 +485,44 @@ mod tests {
         );
         let id = parse_get_caller_identity_response(&xml).unwrap();
         assert_eq!(id.arn, "arn:aws:sts::111122223333:assumed-role/My&Role/s");
+    }
+
+    #[test]
+    fn numeric_character_references_are_resolved() {
+        for (encoded, expected) in [("&#38;", "&"), ("&#x26;", "&"), ("&#65;", "A")] {
+            let xml = wrap(&format!(
+                "<Arn>a{}b</Arn><UserId>U:s</UserId><Account>111122223333</Account>",
+                encoded
+            ));
+            let id = parse_get_caller_identity_response(&xml).unwrap();
+            assert_eq!(id.arn, format!("a{}b", expected), "for {}", encoded);
+        }
+    }
+
+    #[test]
+    fn all_predefined_entities_are_resolved() {
+        for (encoded, expected) in [
+            ("&amp;", "&"),
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&apos;", "'"),
+        ] {
+            let xml = wrap(&format!(
+                "<Arn>x{}y</Arn><UserId>U:s</UserId><Account>111122223333</Account>",
+                encoded
+            ));
+            let id = parse_get_caller_identity_response(&xml).unwrap();
+            assert_eq!(id.arn, format!("x{}y", expected), "for {}", encoded);
+        }
+    }
+
+    #[test]
+    fn multiple_entities_in_one_value() {
+        let xml =
+            wrap("<Arn>a&amp;b&lt;c&gt;d</Arn><UserId>U:s</UserId><Account>111122223333</Account>");
+        let id = parse_get_caller_identity_response(&xml).unwrap();
+        assert_eq!(id.arn, "a&b<c>d");
     }
 
     #[test]

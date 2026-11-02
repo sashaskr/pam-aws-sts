@@ -9,9 +9,20 @@ set -euo pipefail
 
 RELEASE_URL="https://github.com/sashaskr/pam-aws-sts/releases/download/v0.1.0"
 
+# Supply your own values; this script talks to real AWS.
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
+AWS_REGION="${AWS_REGION:-eu-central-1}"
+IAM_ROLE_NAME="${IAM_ROLE_NAME:-YubiKeyKMSRole}"
+
 if [ -z "${PGPASSWORD:-}" ]; then
     echo "ERROR: Set PGPASSWORD to STS credential JSON before running."
     echo "Example: PGPASSWORD=\$(aws_signing_helper credential-process ...) ./scripts/test-distros.sh"
+    exit 1
+fi
+
+if [ -z "$AWS_ACCOUNT_ID" ]; then
+    echo "ERROR: Set AWS_ACCOUNT_ID to the account the credentials belong to."
+    echo "Example: AWS_ACCOUNT_ID=123456789012 IAM_ROLE_NAME=MyRole ./scripts/test-distros.sh"
     exit 1
 fi
 
@@ -52,20 +63,21 @@ test_distro() {
     docker exec "$NAME" bash -c "
         cp /tmp/pam/pam_aws_sts.so ${PAM_PATH}/pam_aws_sts.so &&
         cp /tmp/pam/awssts /etc/pam.d/awssts &&
-        cat > /etc/pam_aws_sts.toml << 'CONF'
+        cat > /etc/pam_aws_sts.toml << 'CONF' &&
 [aws]
-region = \"eu-central-1\"
-allowed_account_ids = [\"370684328700\"]
+region = \"${AWS_REGION}\"
+allowed_account_ids = [\"${AWS_ACCOUNT_ID}\"]
 timeout_secs = 5
 grace_period_secs = 30
 
 [role_mapping]
-\"YubiKeyKMSRole\" = [\"dbadmin\"]
+\"${IAM_ROLE_NAME}\" = [\"dbadmin\"]
 
 [logging]
 level = \"debug\"
 facility = \"auth\"
 CONF
+        chmod 600 /etc/pam_aws_sts.toml
     "
 
     echo "Configuring PostgreSQL for PAM..."
