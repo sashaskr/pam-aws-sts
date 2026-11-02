@@ -45,8 +45,19 @@ impl fmt::Debug for StsCredentials {
 
 impl StsCredentials {
     pub fn from_json(json: &str) -> Result<Self, String> {
-        let creds: StsCredentials =
-            serde_json::from_str(json).map_err(|e| format!("invalid credential JSON: {}", e))?;
+        let creds: StsCredentials = serde_json::from_str(json).map_err(|e| {
+            // The serde_json message is deliberately NOT propagated. For type
+            // mismatches it embeds the offending value, e.g.
+            //   invalid type: integer `9876543210`, expected a string
+            // and the input here is the user-supplied password, so that text
+            // can carry credential material into syslog. Position is safe and
+            // is enough to debug a malformed payload.
+            format!(
+                "malformed credential JSON at line {} column {}",
+                e.line(),
+                e.column()
+            )
+        })?;
 
         if creds.access_key_id.is_empty() {
             return Err("AccessKeyId is empty".into());
@@ -134,7 +145,49 @@ mod tests {
     fn parse_malformed_json() {
         assert!(StsCredentials::from_json("not json")
             .unwrap_err()
-            .contains("invalid credential JSON"));
+            .contains("malformed credential JSON"));
+    }
+
+    // The parse error is logged at warn level by lib.rs, so it must never
+    // carry any part of the password. serde_json embeds offending values in
+    // type-mismatch messages, which is the leak this guards against.
+    #[test]
+    fn parse_error_never_echoes_credential_material() {
+        let cases = [
+            r#"{"AccessKeyId":"a","SecretAccessKey":9876543210,"SessionToken":"t"}"#,
+            r#"{"AccessKeyId":"a","SecretAccessKey":{"nested":"SENSITIVE"},"SessionToken":"t"}"#,
+            r#"{"AccessKeyId":"a","SecretAccessKey":true,"SessionToken":"t"}"#,
+            r#"{"AccessKeyId":["SENSITIVE_ARRAY"],"SecretAccessKey":"s","SessionToken":"t"}"#,
+            r#"{"SecretAccessKey":"LEAKME","SessionToken":"t"}"#,
+        ];
+        for case in cases {
+            let err = StsCredentials::from_json(case).unwrap_err();
+            for needle in ["9876543210", "SENSITIVE", "LEAKME", "true"] {
+                assert!(
+                    !err.contains(needle),
+                    "error leaked {:?} from input {:?}: {}",
+                    needle,
+                    case,
+                    err
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_error_keeps_position_for_debugging() {
+        let err = StsCredentials::from_json("{bad").unwrap_err();
+        assert!(err.contains("line"), "position missing: {}", err);
+        assert!(err.contains("column"), "position missing: {}", err);
+    }
+
+    // A whole-password echo is the worst case: a user pasting the wrong secret
+    // into the password field must not see it land in the auth log.
+    #[test]
+    fn parse_error_does_not_echo_entire_password() {
+        let password = "this-is-actually-some-other-secret-the-user-pasted";
+        let err = StsCredentials::from_json(password).unwrap_err();
+        assert!(!err.contains(password), "whole input echoed: {}", err);
     }
 
     #[test]
