@@ -85,31 +85,54 @@ extern "C" {
     fn pam_get_item(pamh: *const PamHandle, item_type: c_int, item: *mut *const c_void) -> c_int;
 }
 
+/// Reads a PAM item as an owned `String`.
+///
+/// # Safety
+/// `pamh` must be a valid PAM handle for the current transaction.
 unsafe fn get_pam_item_str(pamh: *const PamHandle, item_type: c_int) -> Result<String, c_int> {
     let mut item_ptr: *const c_void = ptr::null();
-    let ret = pam_get_item(pamh, item_type, &mut item_ptr);
+    // SAFETY: pamh is a valid handle per this function's contract, and
+    // item_ptr points to a live local.
+    let ret = unsafe { pam_get_item(pamh, item_type, &mut item_ptr) };
     if ret != PAM_SUCCESS || item_ptr.is_null() {
         return Err(PAM_AUTHINFO_UNAVAIL);
     }
-    CStr::from_ptr(item_ptr as *const c_char)
+    // SAFETY: pam_get_item returned PAM_SUCCESS with a non-null pointer, so it
+    // points to a NUL-terminated string owned by the PAM framework and valid
+    // for at least the duration of this call.
+    unsafe { CStr::from_ptr(item_ptr as *const c_char) }
         .to_str()
-        .map(|s| s.to_string())
+        .map(str::to_owned)
         .map_err(|_| PAM_AUTH_ERR)
 }
 
+/// Obtains the password through the PAM conversation function.
+///
+/// PostgreSQL's conversation function returns the password it received from
+/// the client, so this is how the credential JSON arrives. `PAM_AUTHTOK` is
+/// deliberately not consulted: this module is the only auth module in the
+/// shipped stack, so there is no earlier module to inherit a token from, and
+/// it does not store one either, since passing live AWS credentials to
+/// whatever else might be stacked is not a favour worth doing.
+///
+/// # Safety
+/// `pamh` must be a valid PAM handle for the current transaction.
 unsafe fn get_password_via_conv(pamh: *const PamHandle) -> Result<String, c_int> {
     let mut conv_ptr: *const c_void = ptr::null();
-    let ret = pam_get_item(pamh, PAM_CONV, &mut conv_ptr);
+    // SAFETY: pamh is valid per this function's contract.
+    let ret = unsafe { pam_get_item(pamh, PAM_CONV, &mut conv_ptr) };
     if ret != PAM_SUCCESS || conv_ptr.is_null() {
         return Err(PAM_CRED_INSUFFICIENT);
     }
 
-    // SAFETY: pam_get_item returned PAM_SUCCESS with a non-null pointer.
-    // The PAM API guarantees this points to a valid pam_conv struct owned
-    // by the PAM framework for the lifetime of this call.
     let conv_nn = NonNull::new(conv_ptr as *mut PamConv).ok_or(PAM_CRED_INSUFFICIENT)?;
-    let conv_fn = (*conv_nn.as_ptr()).conv.ok_or(PAM_CRED_INSUFFICIENT)?;
-    let appdata = (*conv_nn.as_ptr()).appdata_ptr;
+    // SAFETY: pam_get_item returned PAM_SUCCESS with a non-null pointer, so it
+    // points to a pam_conv owned by the PAM framework and valid for at least
+    // the duration of this call. Read by value rather than held as a
+    // reference, so no borrow outlives the call.
+    let conv = unsafe { ptr::read(conv_nn.as_ptr()) };
+    let conv_fn = conv.conv.ok_or(PAM_CRED_INSUFFICIENT)?;
+    let appdata = conv.appdata_ptr;
 
     let prompt = CString::new("Password: ").map_err(|_| PAM_AUTH_ERR)?;
     let msg = PamMessage {
@@ -119,28 +142,37 @@ unsafe fn get_password_via_conv(pamh: *const PamHandle) -> Result<String, c_int>
     let msg_ptr: *const PamMessage = &msg;
 
     let mut resp_ptr: *mut PamResponse = ptr::null_mut();
-    let ret = conv_fn(
-        1,
-        &msg_ptr as *const _ as *mut *const PamMessage,
-        &mut resp_ptr,
-        appdata,
-    );
+    // SAFETY: conv_fn comes from the PAM framework. It is passed a
+    // single-element array of message pointers matching num_msg = 1, and
+    // resp_ptr points to a live local for it to fill in.
+    let ret = unsafe {
+        conv_fn(
+            1,
+            &msg_ptr as *const _ as *mut *const PamMessage,
+            &mut resp_ptr,
+            appdata,
+        )
+    };
 
     if ret != PAM_SUCCESS || resp_ptr.is_null() {
         return Err(PAM_CRED_INSUFFICIENT);
     }
 
-    // SAFETY: conv_fn returned PAM_SUCCESS with a non-null resp_ptr.
-    // The response was allocated by the PAM conversation function; we own it.
     let resp_nn = NonNull::new(resp_ptr).ok_or(PAM_CRED_INSUFFICIENT)?;
-    let resp_resp = (*resp_nn.as_ptr()).resp;
-    free(resp_ptr as *mut c_void);
+    // SAFETY: conv_fn returned PAM_SUCCESS with a non-null resp_ptr, so the
+    // response array was allocated by the conversation function and is ours to
+    // read and free. The inner `resp` pointer is copied out before the array
+    // is freed, so it does not dangle.
+    let resp_resp = unsafe { (*resp_nn.as_ptr()).resp };
+    // SAFETY: resp_ptr was allocated by the conversation function with the
+    // malloc family and is freed exactly once here.
+    unsafe { free(resp_ptr as *mut c_void) };
 
     if resp_resp.is_null() {
         return Err(PAM_CRED_INSUFFICIENT);
     }
 
-    // SAFETY: resp_resp is non-null and was allocated by the PAM conversation
+    // resp_resp is non-null and was allocated by the PAM conversation
     // function. Ownership moves into the guard, which scrubs and frees it on
     // every exit path from here on.
     let response = ConvResponse(resp_resp);
@@ -185,7 +217,12 @@ impl Drop for ConvResponse {
     }
 }
 
-fn parse_config_path(argc: c_int, argv: *const *const c_char) -> String {
+/// Reads the `config=` module argument from the PAM service file.
+///
+/// # Safety
+/// `argv` must be null, or point to `argc` pointers each of which is null or a
+/// NUL-terminated string.
+unsafe fn parse_config_path(argc: c_int, argv: *const *const c_char) -> String {
     let default_path = "/etc/pam_aws_sts.toml";
 
     if argv.is_null() || argc <= 0 {
@@ -193,10 +230,12 @@ fn parse_config_path(argc: c_int, argv: *const *const c_char) -> String {
     }
 
     for i in 0..argc as isize {
+        // SAFETY: i is below argc, and argv holds argc entries per contract.
         let arg_ptr = unsafe { *argv.offset(i) };
         if arg_ptr.is_null() {
             continue;
         }
+        // SAFETY: non-null entries are NUL-terminated strings per contract.
         let arg = match unsafe { CStr::from_ptr(arg_ptr) }.to_str() {
             Ok(s) => s,
             Err(_) => continue,
@@ -246,18 +285,24 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     })
 }
 
+/// # Safety
+/// `pamh` must be a valid PAM handle, and `argv` must point to `argc`
+/// NUL-terminated strings or be null.
 unsafe fn authenticate_impl(
     pamh: *const PamHandle,
     argc: c_int,
     argv: *const *const c_char,
 ) -> c_int {
-    let config_path = parse_config_path(argc, argv);
+    // SAFETY: argv/argc satisfy this function's contract.
+    let config_path = unsafe { parse_config_path(argc, argv) };
 
     // Optional. PostgreSQL sets PAM_RHOST for TCP connections but not for the
     // local socket, and another PAM application may not set it at all.
-    let rhost = get_pam_item_str(pamh, PAM_RHOST).ok();
+    // SAFETY: pamh is valid per this function's contract.
+    let rhost = unsafe { get_pam_item_str(pamh, PAM_RHOST) }.ok();
 
-    let username = match get_pam_item_str(pamh, PAM_USER) {
+    // SAFETY: as above.
+    let username = match unsafe { get_pam_item_str(pamh, PAM_USER) } {
         Ok(u) => u,
         Err(code) => {
             // The configured log level is not known yet, so fall back to the
@@ -274,7 +319,8 @@ unsafe fn authenticate_impl(
     // Held in Zeroizing so the secret is scrubbed on the unwinding path as
     // well as on normal return. A plain String would be freed without being
     // overwritten if anything below panicked.
-    let password = match get_password_via_conv(pamh) {
+    // SAFETY: pamh is valid per this function's contract.
+    let password = match unsafe { get_password_via_conv(pamh) } {
         Ok(p) => Zeroizing::new(p),
         Err(code) => {
             init_logging(DEFAULT_LOG_LEVEL, DEFAULT_LOG_FACILITY);
@@ -328,6 +374,14 @@ pub unsafe extern "C" fn pam_sm_acct_mgmt(
     })
 }
 
+// Only the auth and account management groups are implemented. There is
+// deliberately no pam_sm_open_session, pam_sm_close_session or
+// pam_sm_chauthtok: this module authenticates an AWS identity and has nothing
+// to contribute to session setup, and there is no password here to change.
+//
+// A PAM service file that lists this module under `session` or `password` will
+// therefore fail with a symbol lookup error rather than a clear message, so
+// the shipped config/pam.d/awssts lists only auth and account.
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_setcred(
     _pamh: *const PamHandle,
@@ -344,7 +398,9 @@ mod tests {
 
     #[test]
     fn default_config_path() {
-        assert_eq!(parse_config_path(0, ptr::null()), "/etc/pam_aws_sts.toml");
+        // SAFETY: a null argv with argc 0 is explicitly permitted.
+        let path = unsafe { parse_config_path(0, ptr::null()) };
+        assert_eq!(path, "/etc/pam_aws_sts.toml");
     }
 
     /// Runs `f` with the panic hook silenced, so a deliberately panicking test

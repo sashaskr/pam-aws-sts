@@ -44,6 +44,26 @@ fn extract_role_name(arn: &str) -> Result<String, String> {
         return Err(format!("invalid ARN: '{}'", arn));
     }
 
+    // The leading fields were previously skipped entirely. They are cheap to
+    // check and pin the shape of what we are about to trust: anything that is
+    // not an IAM or STS principal ARN has no business reaching role
+    // extraction, whatever its resource section happens to look like.
+    if parts[0] != "arn" {
+        return Err(format!("not an ARN: '{}'", arn));
+    }
+    if !parts[1].starts_with("aws") {
+        return Err(format!(
+            "unrecognized ARN partition '{}' in '{}'",
+            parts[1], arn
+        ));
+    }
+    if parts[2] != "iam" && parts[2] != "sts" {
+        return Err(format!(
+            "ARN service must be iam or sts, got '{}' in '{}'",
+            parts[2], arn
+        ));
+    }
+
     let resource = parts[5];
 
     if let Some(rest) = resource.strip_prefix("assumed-role/") {
@@ -235,6 +255,47 @@ allowed_account_ids = ["111122223333"]
     #[test]
     fn extract_federated_user_rejected() {
         assert!(extract_role_name("arn:aws:sts::123:federated-user/alice").is_err());
+    }
+
+    // --- ARN shape ---
+
+    #[test]
+    fn non_arn_prefix_rejected() {
+        let err = extract_role_name("urn:aws:sts::123:assumed-role/R/s").unwrap_err();
+        assert!(err.contains("not an ARN"), "got: {}", err);
+    }
+
+    #[test]
+    fn unknown_partition_rejected() {
+        let err = extract_role_name("arn:notaws:sts::123:assumed-role/R/s").unwrap_err();
+        assert!(err.contains("partition"), "got: {}", err);
+    }
+
+    #[test]
+    fn known_partitions_accepted() {
+        for partition in ["aws", "aws-cn", "aws-us-gov", "aws-iso"] {
+            let arn = format!("arn:{}:sts::123456789012:assumed-role/R/s", partition);
+            assert_eq!(
+                extract_role_name(&arn).unwrap(),
+                "R",
+                "partition {} should parse",
+                partition
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_service_rejected() {
+        for service in ["s3", "ec2", "lambda", ""] {
+            let arn = format!("arn:aws:{}::123456789012:assumed-role/R/s", service);
+            let err = extract_role_name(&arn).unwrap_err();
+            assert!(
+                err.contains("must be iam or sts"),
+                "service {:?} should be rejected, got: {}",
+                service,
+                err
+            );
+        }
     }
 
     // --- account-scoped mapping ---

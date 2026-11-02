@@ -1,3 +1,10 @@
+// Inside an `unsafe fn`, every operation is implicitly unsafe, so individual
+// raw-pointer accesses are invisible and carry no required justification. That
+// is the shape of the two pointer bugs this module has already had to fix
+// (CodeQL alerts on PamConv handling). Requiring an explicit block makes each
+// one a deliberate, reviewable act.
+#![deny(unsafe_op_in_unsafe_fn)]
+
 mod config;
 mod credentials;
 #[cfg(target_os = "linux")]
@@ -78,10 +85,9 @@ pub fn authenticate_from(
         }
     };
 
-    if let Err(e) = creds.check_expiration(
-        config.aws.grace_period_secs.unwrap_or(30),
-        config.aws.require_expiration,
-    ) {
+    if let Err(e) =
+        creds.check_expiration(config.aws.grace_period_secs, config.aws.require_expiration)
+    {
         log::warn!(
             "auth failed: user='{}', source='{}', reason: {}",
             username,

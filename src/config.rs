@@ -65,7 +65,10 @@ pub struct AwsConfig {
     // fix applied to one would not have taken effect.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-    pub grace_period_secs: Option<u64>,
+    /// Defaulted through serde like the other optional values, rather than
+    /// being an Option whose fallback lived at the call site in lib.rs.
+    #[serde(default = "default_grace_period")]
+    pub grace_period_secs: u64,
     /// Rejects credentials that carry no `Expiration` field.
     ///
     /// `Expiration` is supplied by the client in the same payload as the
@@ -112,8 +115,14 @@ impl Default for LoggingConfig {
     }
 }
 
+pub const DEFAULT_GRACE_PERIOD_SECS: u64 = 30;
+
 fn default_timeout() -> u64 {
     5
+}
+
+fn default_grace_period() -> u64 {
+    DEFAULT_GRACE_PERIOD_SECS
 }
 
 /// Used until the config has been read, so that a config load failure is
@@ -173,6 +182,25 @@ fn validate_region(region: &str) -> Result<(), String> {
              like us-east-1, eu-central-1 or cn-north-1)",
             region
         ));
+    }
+    Ok(())
+}
+
+/// Rejects anything that is not a 12-digit AWS account id.
+///
+/// An entry that cannot match any real account fails closed, which is safe but
+/// silent. The failure mode worth preventing is an operator writing "*" and
+/// believing it allows every account: that locks everyone out instead, with
+/// only a "not in allowed_account_ids" line to explain it.
+fn validate_account_ids(ids: &[String]) -> Result<(), String> {
+    for id in ids {
+        if id.len() != 12 || !id.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "aws.allowed_account_ids contains '{}', which is not a 12-digit AWS \
+                 account id. Wildcards are not supported; list each account explicitly.",
+                id
+            ));
+        }
     }
     Ok(())
 }
@@ -308,6 +336,7 @@ impl Config {
         if config.aws.allowed_account_ids.is_empty() {
             return Err("aws.allowed_account_ids must contain at least one account".into());
         }
+        validate_account_ids(&config.aws.allowed_account_ids)?;
         if config.role_mapping.is_empty() {
             return Err("role_mapping must contain at least one mapping".into());
         }
@@ -392,7 +421,7 @@ facility = "auth"
         assert_eq!(config.aws.region, "eu-central-1");
         assert_eq!(config.aws.allowed_account_ids, vec!["111122223333"]);
         assert_eq!(config.aws.timeout_secs, 5);
-        assert_eq!(config.aws.grace_period_secs, Some(30));
+        assert_eq!(config.aws.grace_period_secs, 30);
         assert_eq!(
             config
                 .allowed_users_for("111122223333", "YubiKeyKMSRole")
@@ -674,6 +703,67 @@ use_fips_endpoint = true
     }
 
     #[test]
+    fn malformed_account_ids_rejected() {
+        for bad in [
+            "*",
+            "12345",
+            "1234567890123",
+            "11112222333a",
+            "",
+            "111-222-333",
+        ] {
+            let toml = format!(
+                r#"
+[aws]
+region = "us-east-1"
+allowed_account_ids = ["{}"]
+
+[role_mapping]
+"R" = ["u"]
+"#,
+                bad
+            );
+            let err = Config::from_str(&toml).unwrap_err();
+            assert!(
+                err.contains("12-digit AWS"),
+                "account id {:?} should be rejected, got: {}",
+                bad,
+                err
+            );
+        }
+    }
+
+    // A wildcard reads like "allow everything" but fails closed, locking
+    // everyone out with only an unhelpful log line. The error says so.
+    #[test]
+    fn wildcard_account_id_error_mentions_wildcards() {
+        let toml = r#"
+[aws]
+region = "us-east-1"
+allowed_account_ids = ["*"]
+
+[role_mapping]
+"R" = ["u"]
+"#;
+        assert!(Config::from_str(toml)
+            .unwrap_err()
+            .contains("Wildcards are not supported"));
+    }
+
+    #[test]
+    fn valid_account_ids_accepted() {
+        let toml = r#"
+[aws]
+region = "us-east-1"
+allowed_account_ids = ["111122223333", "000000000000", "999999999999"]
+
+[role_mapping."111122223333"]
+"R" = ["u"]
+"#;
+        assert!(Config::from_str(toml).is_ok());
+    }
+
+    #[test]
     fn empty_allowed_accounts_rejected() {
         let toml = r#"
 [aws]
@@ -712,7 +802,7 @@ allowed_account_ids = ["123456789012"]
 "#;
         let config = Config::from_str(toml).unwrap();
         assert_eq!(config.aws.timeout_secs, 5);
-        assert_eq!(config.aws.grace_period_secs, None);
+        assert_eq!(config.aws.grace_period_secs, DEFAULT_GRACE_PERIOD_SECS);
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.facility, "auth");
     }
