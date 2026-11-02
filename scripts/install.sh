@@ -18,15 +18,48 @@ echo "Creating dbadmin role..."
 docker compose exec postgres psql -U postgres -d testdb -c \
     "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='dbadmin') THEN CREATE ROLE dbadmin LOGIN; END IF; END \$\$;"
 
+# PAM sends the password (here: live STS credentials) in cleartext, so the dev
+# loop runs over TLS too. Keeping dev aligned with the shipped pg_hba.conf is
+# deliberate: a test harness that demonstrates plaintext auth is how the
+# insecure pattern gets copied into production.
+echo "Generating a self-signed server certificate (dev only)..."
+docker compose exec -T postgres bash -c '
+    set -e
+    cd /var/lib/postgresql/data
+    if [ ! -f server.crt ]; then
+        openssl req -new -x509 -days 365 -nodes -text \
+            -out server.crt -keyout server.key -subj "/CN=localhost" 2>/dev/null
+    fi
+    chmod 600 server.key
+    chown postgres:postgres server.key server.crt
+'
+
+echo "Enabling TLS..."
+docker compose exec -T postgres bash -c '
+    set -e
+    conf=/var/lib/postgresql/data/postgresql.conf
+    grep -q "^ssl = on" "$conf" || printf "\nssl = on\nssl_cert_file = '"'"'server.crt'"'"'\nssl_key_file = '"'"'server.key'"'"'\n" >> "$conf"
+'
+
 echo "Updating pg_hba.conf..."
-docker compose exec postgres bash -c 'cat > /var/lib/postgresql/data/pg_hba.conf << EOF
-local   all   postgres                 trust
-host    all   postgres   0.0.0.0/0     trust
-host    all   all        0.0.0.0/0     pam    pamservice=awssts
-local   all   all                      pam    pamservice=awssts
+docker compose exec -T postgres bash -c 'cat > /var/lib/postgresql/data/pg_hba.conf << EOF
+local     all   postgres                 trust
+hostssl   all   postgres   0.0.0.0/0     trust
+hostssl   all   all        0.0.0.0/0     pam    pamservice=awssts
+host      all   all        0.0.0.0/0     reject
+local     all   all                      pam    pamservice=awssts
 EOF'
 
-echo "Reloading PostgreSQL..."
-docker compose exec postgres psql -U postgres -c "SELECT pg_reload_conf();"
+echo "Restarting PostgreSQL to pick up TLS..."
+docker compose restart postgres
+docker compose exec -T postgres sh -c 'until pg_isready -q; do sleep 1; done'
 
-echo "Done. PAM is active."
+echo "Verifying plaintext connections are refused..."
+if PGSSLMODE=disable docker compose exec -T postgres \
+    psql -h 127.0.0.1 -U dbadmin -d testdb -c 'select 1' >/dev/null 2>&1; then
+    echo "ERROR: a plaintext connection succeeded; pg_hba.conf is not enforcing TLS" >&2
+    exit 1
+fi
+echo "  plaintext refused as expected"
+
+echo "Done. PAM is active over TLS."

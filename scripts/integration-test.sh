@@ -24,6 +24,11 @@ fail() { echo -e "${RED}FAIL${NC}: $1 — $2"; ((FAIL++)); }
 PG_HOST="${PG_HOST:-localhost}"
 PG_PORT="${PG_PORT:-5432}"
 
+# PAM sends the password in cleartext, and here the password is a live set of
+# STS credentials. Every test below must therefore run over TLS; a plaintext
+# attempt is asserted to fail in Test 0.
+export PGSSLMODE=require
+
 echo "=== pam_aws_sts Integration Tests ==="
 echo "Target: ${PG_HOST}:${PG_PORT}"
 echo ""
@@ -43,6 +48,17 @@ if ! pg_isready -h "$PG_HOST" -p "$PG_PORT" -U postgres >/dev/null 2>&1; then
 fi
 echo "PostgreSQL is ready."
 echo ""
+
+# --- Test 0: Plaintext connections must be refused ---
+# This guards the property that makes every other test safe: credentials must
+# never be transmittable in the clear.
+echo "Test 0: Plaintext connection refused"
+if PGSSLMODE=disable PGPASSWORD="anything" \
+    psql -h "$PG_HOST" -p "$PG_PORT" -U pg_admin -d testdb -c "SELECT 1" >/dev/null 2>&1; then
+    fail "Plaintext connection" "accepted a non-TLS connection; pg_hba.conf must use hostssl"
+else
+    pass "Plaintext connection refused"
+fi
 
 # --- Test 1: Garbage password should fail ---
 echo "Test 1: Garbage password"

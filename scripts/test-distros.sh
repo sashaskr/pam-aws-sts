@@ -74,27 +74,57 @@ CONF
         su - postgres -c \"psql -c \\\"CREATE DATABASE testdb\\\"\" 2>/dev/null || true
     "
 
+    # PAM transmits the password (live STS credentials) in cleartext, so the
+    # artifact test runs over TLS, matching the shipped config/pg_hba.conf.
+    echo "Enabling TLS and configuring PAM..."
     docker exec "$NAME" bash -c '
+        set -e
+        PG_DATA=$(su - postgres -c "psql -t -c \"SHOW data_directory\"" | tr -d " ")
         PG_HBA=$(su - postgres -c "psql -t -c \"SHOW hba_file\"" | tr -d " ")
-        cat > "$PG_HBA" << EOF
-local   all   postgres                 trust
-host    all   postgres   0.0.0.0/0     trust
-host    all   all        0.0.0.0/0     pam    pamservice=awssts
-local   all   all                      pam    pamservice=awssts
-EOF
-        su - postgres -c "psql -c \"SELECT pg_reload_conf()\""
-    '
+        PG_CONF=$(su - postgres -c "psql -t -c \"SHOW config_file\"" | tr -d " ")
 
-    echo "Testing garbage password (should fail)..."
-    if PGPASSWORD="garbage" psql -h localhost -p 5432 -U dbadmin -d testdb -c "SELECT 1" 2>/dev/null; then
+        if [ ! -f "$PG_DATA/server.crt" ]; then
+            openssl req -new -x509 -days 365 -nodes -text \
+                -out "$PG_DATA/server.crt" -keyout "$PG_DATA/server.key" \
+                -subj "/CN=localhost" 2>/dev/null
+        fi
+        chmod 600 "$PG_DATA/server.key"
+        chown postgres:postgres "$PG_DATA/server.key" "$PG_DATA/server.crt"
+
+        grep -q "^ssl = on" "$PG_CONF" || \
+            printf "\nssl = on\nssl_cert_file = '"'"'server.crt'"'"'\nssl_key_file = '"'"'server.key'"'"'\n" >> "$PG_CONF"
+
+        cat > "$PG_HBA" << EOF
+local     all   postgres                 trust
+hostssl   all   postgres   0.0.0.0/0     trust
+hostssl   all   all        0.0.0.0/0     pam    pamservice=awssts
+host      all   all        0.0.0.0/0     reject
+local     all   all                      pam    pamservice=awssts
+EOF
+        su - postgres -c "pg_ctl restart -D $PG_DATA -l /tmp/pg.log -m fast"
+    '
+    sleep 3
+
+    echo "Testing plaintext connection is refused (should fail)..."
+    if PGSSLMODE=disable PGPASSWORD="garbage" \
+        psql -h localhost -p 5432 -U dbadmin -d testdb -c "SELECT 1" >/dev/null 2>&1; then
+        echo "  FAIL: plaintext connection was accepted"
+        return 1
+    else
+        echo "  PASS: plaintext refused"
+    fi
+
+    echo "Testing garbage password over TLS (should fail)..."
+    if PGSSLMODE=require PGPASSWORD="garbage" \
+        psql -h localhost -p 5432 -U dbadmin -d testdb -c "SELECT 1" 2>/dev/null; then
         echo "  FAIL: garbage accepted"
         return 1
     else
         echo "  PASS: garbage rejected"
     fi
 
-    echo "Testing real STS creds..."
-    if psql -h localhost -p 5432 -U dbadmin -d testdb -c "SELECT current_user;" 2>&1; then
+    echo "Testing real STS creds over TLS..."
+    if PGSSLMODE=require psql -h localhost -p 5432 -U dbadmin -d testdb -c "SELECT current_user;" 2>&1; then
         echo "  PASS: authenticated"
     else
         echo "  FAIL: auth failed"
