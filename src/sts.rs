@@ -25,13 +25,10 @@ pub struct StsClient {
 
 impl StsClient {
     pub fn new(config: &AwsConfig) -> Self {
-        let endpoint = config
-            .sts_endpoint
-            .clone()
-            .unwrap_or_else(|| format!("https://sts.{}.amazonaws.com", config.region));
-
         Self {
-            endpoint,
+            // Single source of truth for endpoint resolution, so partition and
+            // FIPS handling cannot drift from Config::sts_endpoint().
+            endpoint: config.resolved_endpoint(),
             region: config.region.clone(),
             timeout_secs: config.timeout_secs,
         }

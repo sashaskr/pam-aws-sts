@@ -56,6 +56,13 @@ pub struct AwsConfig {
     pub region: String,
     pub allowed_account_ids: Vec<String>,
     pub sts_endpoint: Option<String>,
+    /// Uses the `sts-fips.*` endpoint for the region.
+    #[serde(default)]
+    pub use_fips_endpoint: bool,
+    // NOTE: endpoint resolution lives in `resolved_endpoint()` below, and only
+    // there. It used to be duplicated between a `Config::sts_endpoint()` helper
+    // and `StsClient::new`, with only the StsClient copy on the live path, so a
+    // fix applied to one would not have taken effect.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     pub grace_period_secs: Option<u64>,
@@ -85,6 +92,17 @@ pub struct LoggingConfig {
     pub facility: String,
 }
 
+impl AwsConfig {
+    /// The STS endpoint to call: the explicit override if set, otherwise one
+    /// derived from the region's partition.
+    pub fn resolved_endpoint(&self) -> String {
+        if let Some(explicit) = &self.sts_endpoint {
+            return explicit.clone();
+        }
+        derive_sts_endpoint(&self.region, self.use_fips_endpoint)
+    }
+}
+
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
@@ -109,6 +127,54 @@ fn default_log_level() -> String {
 
 fn default_facility() -> String {
     DEFAULT_LOG_FACILITY.into()
+}
+
+/// DNS suffix for the partition a region belongs to.
+///
+/// AWS documents the regional endpoint form as
+/// `https://sts.{region_identifier}.{partition_domain}`, and the partition
+/// domain is not constant: China regions use `amazonaws.com.cn`. Hardcoding
+/// `.amazonaws.com` silently produced an unresolvable hostname there.
+/// GovCloud stays on `amazonaws.com`.
+fn partition_domain(region: &str) -> &'static str {
+    if region.starts_with("cn-") {
+        "amazonaws.com.cn"
+    } else {
+        "amazonaws.com"
+    }
+}
+
+/// Builds the regional STS endpoint. Always https.
+fn derive_sts_endpoint(region: &str, use_fips: bool) -> String {
+    let host = if use_fips { "sts-fips" } else { "sts" };
+    format!("https://{}.{}.{}", host, region, partition_domain(region))
+}
+
+/// Rejects a region identifier that cannot be a real region.
+///
+/// The region is interpolated into a hostname and used as the SigV4 signing
+/// scope, so a typo previously surfaced as a DNS failure on every login
+/// attempt rather than as a config error once. Checked by shape rather than
+/// against a fixed list, so new regions keep working without a code change.
+fn validate_region(region: &str) -> Result<(), String> {
+    let shape_ok = !region.is_empty()
+        && region.len() <= 64
+        && region.contains('-')
+        && region
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && region.starts_with(|c: char| c.is_ascii_lowercase())
+        && region.ends_with(|c: char| c.is_ascii_digit())
+        && !region.contains("--");
+
+    if !shape_ok {
+        return Err(format!(
+            "aws.region '{}' is not a valid region identifier (expected a form \
+             like us-east-1, eu-central-1 or cn-north-1)",
+            region
+        ));
+    }
+    Ok(())
 }
 
 /// Largest accepted `timeout_secs`.
@@ -238,9 +304,7 @@ impl Config {
         let config: Config =
             toml::from_str(content).map_err(|e| format!("TOML parse error: {}", e))?;
 
-        if config.aws.region.is_empty() {
-            return Err("aws.region must not be empty".into());
-        }
+        validate_region(&config.aws.region)?;
         if config.aws.allowed_account_ids.is_empty() {
             return Err("aws.allowed_account_ids must contain at least one account".into());
         }
@@ -301,14 +365,6 @@ impl Config {
             RoleMapping::Flat(flat) => flat.get(role).map(Vec::as_slice),
         }
     }
-
-    #[allow(dead_code)]
-    pub fn sts_endpoint(&self) -> String {
-        self.aws
-            .sts_endpoint
-            .clone()
-            .unwrap_or_else(|| format!("https://sts.{}.amazonaws.com", self.aws.region))
-    }
 }
 
 #[cfg(test)]
@@ -351,7 +407,7 @@ facility = "auth"
     fn sts_endpoint_default() {
         let config = Config::from_str(VALID_CONFIG).unwrap();
         assert_eq!(
-            config.sts_endpoint(),
+            config.aws.resolved_endpoint(),
             "https://sts.eu-central-1.amazonaws.com"
         );
     }
@@ -368,7 +424,10 @@ sts_endpoint = "https://sts.internal.example.com"
 "SomeRole" = ["user1"]
 "#;
         let config = Config::from_str(toml).unwrap();
-        assert_eq!(config.sts_endpoint(), "https://sts.internal.example.com");
+        assert_eq!(
+            config.aws.resolved_endpoint(),
+            "https://sts.internal.example.com"
+        );
     }
 
     #[test]
@@ -404,7 +463,7 @@ allow_insecure_endpoint = true
 "SomeRole" = ["user1"]
 "#;
         let config = Config::from_str(toml).unwrap();
-        assert_eq!(config.sts_endpoint(), "http://localhost:4566");
+        assert_eq!(config.aws.resolved_endpoint(), "http://localhost:4566");
     }
 
     #[test]
@@ -451,22 +510,167 @@ allow_insecure_endpoint = true
     fn derived_default_endpoint_is_https() {
         let config = Config::from_str(VALID_CONFIG).unwrap();
         assert!(config.aws.sts_endpoint.is_none());
-        assert!(config.sts_endpoint().starts_with("https://"));
+        assert!(config.aws.resolved_endpoint().starts_with("https://"));
     }
 
-    #[test]
-    fn missing_region_rejected() {
-        let toml = r#"
+    fn config_with_region(region: &str) -> Result<Config, String> {
+        Config::from_str(&format!(
+            r#"
 [aws]
-region = ""
+region = "{}"
 allowed_account_ids = ["111122223333"]
 
 [role_mapping]
 "R" = ["u"]
-"#;
-        assert!(Config::from_str(toml)
+"#,
+            region
+        ))
+    }
+
+    #[test]
+    fn missing_region_rejected() {
+        assert!(config_with_region("")
             .unwrap_err()
-            .contains("region must not be empty"));
+            .contains("not a valid region identifier"));
+    }
+
+    #[test]
+    fn malformed_regions_rejected() {
+        for region in [
+            "US-East-1",                   // uppercase
+            "us_east_1",                   // underscores
+            "useast1",                     // no hyphen
+            "us-east",                     // no trailing digit
+            "sts.us-east-1.amazonaws.com", // a hostname, not a region
+            "us--east-1",                  // doubled separator
+            "-us-east-1",                  // leading hyphen
+        ] {
+            assert!(
+                config_with_region(region).is_err(),
+                "region {:?} should be rejected",
+                region
+            );
+        }
+    }
+
+    #[test]
+    fn real_regions_accepted() {
+        for region in [
+            "us-east-1",
+            "eu-central-1",
+            "ap-southeast-3",
+            "cn-north-1",
+            "us-gov-west-1",
+            "il-central-1",
+        ] {
+            assert!(
+                config_with_region(region).is_ok(),
+                "region {:?} should be accepted",
+                region
+            );
+        }
+    }
+
+    // --- partition-aware endpoint derivation ---
+
+    #[test]
+    fn commercial_endpoint_derived() {
+        assert_eq!(
+            config_with_region("eu-central-1")
+                .unwrap()
+                .aws
+                .resolved_endpoint(),
+            "https://sts.eu-central-1.amazonaws.com"
+        );
+    }
+
+    // Previously produced sts.cn-north-1.amazonaws.com, which does not resolve.
+    #[test]
+    fn china_endpoint_uses_the_cn_partition_domain() {
+        assert_eq!(
+            config_with_region("cn-north-1")
+                .unwrap()
+                .aws
+                .resolved_endpoint(),
+            "https://sts.cn-north-1.amazonaws.com.cn"
+        );
+        assert_eq!(
+            config_with_region("cn-northwest-1")
+                .unwrap()
+                .aws
+                .resolved_endpoint(),
+            "https://sts.cn-northwest-1.amazonaws.com.cn"
+        );
+    }
+
+    #[test]
+    fn govcloud_stays_on_the_commercial_domain() {
+        assert_eq!(
+            config_with_region("us-gov-west-1")
+                .unwrap()
+                .aws
+                .resolved_endpoint(),
+            "https://sts.us-gov-west-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn fips_endpoint_opt_in() {
+        let toml = r#"
+[aws]
+region = "us-east-1"
+allowed_account_ids = ["111122223333"]
+use_fips_endpoint = true
+
+[role_mapping]
+"R" = ["u"]
+"#;
+        assert_eq!(
+            Config::from_str(toml).unwrap().aws.resolved_endpoint(),
+            "https://sts-fips.us-east-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn explicit_endpoint_overrides_derivation() {
+        let toml = r#"
+[aws]
+region = "cn-north-1"
+allowed_account_ids = ["111122223333"]
+sts_endpoint = "https://vpce-abc.sts.cn-north-1.vpce.amazonaws.com.cn"
+use_fips_endpoint = true
+
+[role_mapping]
+"R" = ["u"]
+"#;
+        assert_eq!(
+            Config::from_str(toml).unwrap().aws.resolved_endpoint(),
+            "https://vpce-abc.sts.cn-north-1.vpce.amazonaws.com.cn"
+        );
+    }
+
+    // Omitting sts_endpoint must be safe by construction: whatever partition
+    // and FIPS combination the region implies, the result is always https.
+    #[test]
+    fn derived_endpoint_is_always_https() {
+        for region in [
+            "us-east-1",
+            "cn-north-1",
+            "cn-northwest-1",
+            "us-gov-east-1",
+            "ap-southeast-3",
+        ] {
+            for fips in [false, true] {
+                let endpoint = derive_sts_endpoint(region, fips);
+                assert!(
+                    endpoint.starts_with("https://"),
+                    "{} (fips={}) produced {}",
+                    region,
+                    fips,
+                    endpoint
+                );
+            }
+        }
     }
 
     #[test]
