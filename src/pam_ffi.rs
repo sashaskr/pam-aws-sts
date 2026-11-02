@@ -103,16 +103,49 @@ unsafe fn get_password_via_conv(pamh: *const PamHandle) -> Result<String, c_int>
         return Err(PAM_CRED_INSUFFICIENT);
     }
 
-    let password = CStr::from_ptr(resp_resp)
-        .to_str()
-        .map(|s| s.to_string())
-        .map_err(|_| PAM_AUTH_ERR)?;
+    // SAFETY: resp_resp is non-null and was allocated by the PAM conversation
+    // function. Ownership moves into the guard, which scrubs and frees it on
+    // every exit path from here on.
+    let response = ConvResponse(resp_resp);
+    response.to_owned_string()
+}
 
-    let resp_len = libc::strlen(resp_resp);
-    ptr::write_bytes(resp_resp as *mut u8, 0, resp_len);
-    free(resp_resp as *mut c_void);
+/// Owns the `char *` returned by a PAM conversation function.
+///
+/// The buffer holds the user's password. Before this guard existed, a password
+/// that was not valid UTF-8 took an early return that skipped both the
+/// overwrite and the `free`, leaking the allocation and leaving the secret
+/// resident in the heap of a long-lived PostgreSQL backend. An attacker could
+/// trigger that on demand by sending one invalid byte.
+struct ConvResponse(*mut c_char);
 
-    Ok(password)
+impl ConvResponse {
+    /// Copies the buffer into an owned `String`.
+    ///
+    /// Returns `PAM_AUTH_ERR` if the bytes are not valid UTF-8. Either way the
+    /// buffer is scrubbed and freed when the guard drops.
+    fn to_owned_string(&self) -> Result<String, c_int> {
+        // SAFETY: self.0 is non-null and NUL-terminated per the invariant
+        // documented at the construction site.
+        unsafe { CStr::from_ptr(self.0) }
+            .to_str()
+            .map(str::to_owned)
+            .map_err(|_| PAM_AUTH_ERR)
+    }
+}
+
+impl Drop for ConvResponse {
+    fn drop(&mut self) {
+        // SAFETY: self.0 was allocated by the PAM conversation function, is
+        // owned solely by this guard, and is freed exactly once here. The
+        // overwrite happens before the free so the secret does not survive in
+        // reusable heap memory.
+        unsafe {
+            let len = libc::strlen(self.0);
+            ptr::write_bytes(self.0 as *mut u8, 0, len);
+            free(self.0 as *mut c_void);
+        }
+    }
 }
 
 fn parse_config_path(argc: c_int, argv: *const *const c_char) -> String {
