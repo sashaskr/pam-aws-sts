@@ -72,11 +72,28 @@ impl StsCredentials {
         Ok(creds)
     }
 
-    pub fn check_expiration(&self, grace_period_secs: u64) -> Result<(), String> {
-        let expiration_str = match &self.expiration {
-            Some(exp) => exp,
-            None => return Ok(()),
-        };
+    /// Checks the client-supplied `Expiration` against the grace period.
+    ///
+    /// `Expiration` arrives in the same payload as the credentials, so this is
+    /// a self-asserted value, not a verified one. Real expiry is enforced by
+    /// STS when the credentials are used. The check still earns its place by
+    /// rejecting soon-to-expire credentials before spending a network call,
+    /// and by refusing to open a database session that will outlive the
+    /// credentials behind it.
+    ///
+    /// Because the field is client-supplied, the grace period is only
+    /// enforceable when the field is present; omitting it skips the check.
+    /// `require` closes that gap for operators who want the guarantee.
+    pub fn check_expiration(&self, grace_period_secs: u64, require: bool) -> Result<(), String> {
+        let expiration_str =
+            match &self.expiration {
+                Some(exp) => exp,
+                None if require => return Err(
+                    "credentials have no Expiration field and aws.require_expiration is enabled"
+                        .into(),
+                ),
+                None => return Ok(()),
+            };
 
         let expiration = parse_expiration(expiration_str)?;
         let now = Utc::now();
@@ -224,7 +241,7 @@ mod tests {
     fn expiration_far_future_passes() {
         let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t","Expiration":"2099-12-31T23:59:59Z"}"#;
         let creds = StsCredentials::from_json(json).unwrap();
-        assert!(creds.check_expiration(30).is_ok());
+        assert!(creds.check_expiration(30, false).is_ok());
     }
 
     #[test]
@@ -232,17 +249,42 @@ mod tests {
         let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t","Expiration":"2020-01-01T00:00:00Z"}"#;
         let creds = StsCredentials::from_json(json).unwrap();
         assert!(creds
-            .check_expiration(30)
+            .check_expiration(30, false)
             .unwrap_err()
             .contains("expired at"));
     }
 
+    // Documents the limitation rather than hiding it: Expiration is supplied
+    // by the client, so omitting it bypasses the grace period entirely.
     #[test]
-    fn expiration_none_skips_check() {
+    fn expiration_none_skips_check_by_default() {
         let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t"}"#;
         let creds = StsCredentials::from_json(json).unwrap();
-        assert!(creds.check_expiration(30).is_ok());
-        assert!(creds.check_expiration(9999).is_ok());
+        assert!(creds.check_expiration(30, false).is_ok());
+        assert!(creds.check_expiration(9999, false).is_ok());
+    }
+
+    #[test]
+    fn expiration_none_rejected_when_required() {
+        let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t"}"#;
+        let creds = StsCredentials::from_json(json).unwrap();
+        let err = creds.check_expiration(30, true).unwrap_err();
+        assert!(err.contains("no Expiration"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn require_expiration_still_accepts_a_valid_expiry() {
+        let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t","Expiration":"2099-12-31T23:59:59Z"}"#;
+        let creds = StsCredentials::from_json(json).unwrap();
+        assert!(creds.check_expiration(30, true).is_ok());
+    }
+
+    #[test]
+    fn require_expiration_does_not_weaken_the_expiry_check() {
+        let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t","Expiration":"2020-01-01T00:00:00Z"}"#;
+        let creds = StsCredentials::from_json(json).unwrap();
+        assert!(creds.check_expiration(30, true).is_err());
+        assert!(creds.check_expiration(30, false).is_err());
     }
 
     #[test]
@@ -251,7 +293,7 @@ mod tests {
             r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t","Expiration":"nope"}"#;
         let creds = StsCredentials::from_json(json).unwrap();
         assert!(creds
-            .check_expiration(30)
+            .check_expiration(30, false)
             .unwrap_err()
             .contains("invalid expiration"));
     }
@@ -260,7 +302,7 @@ mod tests {
     fn expiration_rfc3339_with_offset() {
         let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t","Expiration":"2099-01-15T10:30:00+05:30"}"#;
         let creds = StsCredentials::from_json(json).unwrap();
-        assert!(creds.check_expiration(30).is_ok());
+        assert!(creds.check_expiration(30, false).is_ok());
     }
 
     #[test]
@@ -293,7 +335,7 @@ mod tests {
     fn zero_grace_period() {
         let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t","Expiration":"2099-12-31T23:59:59Z"}"#;
         let creds = StsCredentials::from_json(json).unwrap();
-        assert!(creds.check_expiration(0).is_ok());
+        assert!(creds.check_expiration(0, false).is_ok());
     }
 
     const SECRET: &str = "wJalrXUtnFEMI-UNIQUE-SECRET-MARKER";

@@ -78,7 +78,10 @@ pub fn authenticate_from(
         }
     };
 
-    if let Err(e) = creds.check_expiration(config.aws.grace_period_secs.unwrap_or(30)) {
+    if let Err(e) = creds.check_expiration(
+        config.aws.grace_period_secs.unwrap_or(30),
+        config.aws.require_expiration,
+    ) {
         log::warn!(
             "auth failed: user='{}', source='{}', reason: {}",
             username,

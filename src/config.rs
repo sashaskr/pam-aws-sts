@@ -59,6 +59,15 @@ pub struct AwsConfig {
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     pub grace_period_secs: Option<u64>,
+    /// Rejects credentials that carry no `Expiration` field.
+    ///
+    /// `Expiration` is supplied by the client in the same payload as the
+    /// credentials, so `grace_period_secs` is only enforceable when the field
+    /// is present. Any client can skip that check by omitting it. Enabling
+    /// this makes the grace period a real constraint. Default is off, because
+    /// hand-built credential payloads legitimately omit the field.
+    #[serde(default)]
+    pub require_expiration: bool,
     /// Allows `sts_endpoint` to use plaintext `http://`.
     ///
     /// Intended only for a local mock such as LocalStack. The whole
@@ -100,6 +109,76 @@ fn default_log_level() -> String {
 
 fn default_facility() -> String {
     DEFAULT_LOG_FACILITY.into()
+}
+
+/// Largest accepted `timeout_secs`.
+///
+/// The STS call blocks a PostgreSQL backend, so a long timeout lets a single
+/// stalled request hold a connection slot. Thirty seconds is already far
+/// beyond a healthy STS round trip.
+const MAX_TIMEOUT_SECS: u64 = 30;
+
+fn validate_timeout(timeout_secs: u64) -> Result<(), String> {
+    if timeout_secs == 0 {
+        return Err("aws.timeout_secs must be at least 1".into());
+    }
+    if timeout_secs > MAX_TIMEOUT_SECS {
+        return Err(format!(
+            "aws.timeout_secs is {} but must not exceed {}. The STS call blocks a \
+             PostgreSQL backend, so a long timeout lets stalled requests consume \
+             connection slots.",
+            timeout_secs, MAX_TIMEOUT_SECS
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses to read a config that an untrusted account could rewrite.
+///
+/// This file decides which IAM roles map to which database users, so write
+/// access to it is equivalent to granting database access. The module runs
+/// inside the PostgreSQL backend, under the database account, which is exactly
+/// the kind of process that should not trust a group- or world-writable file.
+/// `make install` sets mode 600, but nothing verified it at runtime.
+#[cfg(unix)]
+fn check_file_trust(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = fs::metadata(path)
+        .map_err(|e| format!("failed to stat config {}: {}", path.display(), e))?;
+
+    let mode = meta.mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "config {} is writable by group or other (mode {:04o}). It controls \
+             which IAM roles may log in as which database users, so this is a \
+             privilege escalation path. Fix with: chmod 600 {}",
+            path.display(),
+            mode,
+            path.display()
+        ));
+    }
+
+    // SAFETY: geteuid is always safe; it takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != 0 && meta.uid() != euid {
+        return Err(format!(
+            "config {} is owned by uid {}, which is neither root nor the running \
+             process (uid {}). An account that owns the file can rewrite the role \
+             mapping. Fix with: chown root {}",
+            path.display(),
+            meta.uid(),
+            euid,
+            path.display()
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_file_trust(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// Rejects an `sts_endpoint` that would carry the identity decision in plaintext.
@@ -147,6 +226,8 @@ impl Config {
             return Err(format!("config file not found: {}", path.display()));
         }
 
+        check_file_trust(path)?;
+
         let content =
             fs::read_to_string(path).map_err(|e| format!("failed to read config: {}", e))?;
 
@@ -169,6 +250,7 @@ impl Config {
         if let Some(endpoint) = &config.aws.sts_endpoint {
             validate_sts_endpoint(endpoint, config.aws.allow_insecure_endpoint)?;
         }
+        validate_timeout(config.aws.timeout_secs)?;
         config.validate_role_mapping()?;
 
         Ok(config)
@@ -595,5 +677,90 @@ allowed_account_ids = ["111122223333"]
         std::fs::write(&path, VALID_CONFIG).unwrap();
         let config = Config::load(path.to_str().unwrap()).unwrap();
         assert_eq!(config.aws.region, "eu-central-1");
+    }
+
+    // --- timeout bounds ---
+
+    #[test]
+    fn zero_timeout_rejected() {
+        let toml = VALID_CONFIG.replace("timeout_secs = 5", "timeout_secs = 0");
+        assert!(Config::from_str(&toml).unwrap_err().contains("at least 1"));
+    }
+
+    #[test]
+    fn excessive_timeout_rejected() {
+        let toml = VALID_CONFIG.replace("timeout_secs = 5", "timeout_secs = 3600");
+        let err = Config::from_str(&toml).unwrap_err();
+        assert!(err.contains("must not exceed"), "unexpected error: {}", err);
+        assert!(err.contains("blocks a PostgreSQL backend"));
+    }
+
+    #[test]
+    fn boundary_timeouts_accepted() {
+        for secs in [1, MAX_TIMEOUT_SECS] {
+            let toml =
+                VALID_CONFIG.replace("timeout_secs = 5", &format!("timeout_secs = {}", secs));
+            assert!(
+                Config::from_str(&toml).is_ok(),
+                "timeout_secs = {} should be accepted",
+                secs
+            );
+        }
+    }
+
+    // --- config file trust ---
+
+    #[cfg(unix)]
+    mod file_trust {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_config_with_mode(mode: u32) -> (tempfile::TempDir, std::path::PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pam_aws_sts.toml");
+            std::fs::write(&path, VALID_CONFIG).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            (dir, path)
+        }
+
+        #[test]
+        fn mode_600_accepted() {
+            let (_dir, path) = write_config_with_mode(0o600);
+            assert!(Config::load(path.to_str().unwrap()).is_ok());
+        }
+
+        #[test]
+        fn mode_644_accepted() {
+            // World-readable is acceptable; the file holds no secrets. Only
+            // write access confers privilege.
+            let (_dir, path) = write_config_with_mode(0o644);
+            assert!(Config::load(path.to_str().unwrap()).is_ok());
+        }
+
+        #[test]
+        fn group_writable_rejected() {
+            let (_dir, path) = write_config_with_mode(0o620);
+            let err = Config::load(path.to_str().unwrap()).unwrap_err();
+            assert!(
+                err.contains("writable by group or other"),
+                "unexpected error: {}",
+                err
+            );
+            assert!(err.contains("chmod 600"), "error should say how to fix it");
+        }
+
+        #[test]
+        fn world_writable_rejected() {
+            let (_dir, path) = write_config_with_mode(0o602);
+            assert!(Config::load(path.to_str().unwrap())
+                .unwrap_err()
+                .contains("writable by group or other"));
+        }
+
+        #[test]
+        fn world_writable_with_sticky_like_bits_still_rejected() {
+            let (_dir, path) = write_config_with_mode(0o666);
+            assert!(Config::load(path.to_str().unwrap()).is_err());
+        }
     }
 }
