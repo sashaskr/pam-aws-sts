@@ -3,8 +3,14 @@ name: CI
 on:
   push:
     branches: [main]
+  # Deliberately not filtered to `branches: [main]`. With that filter a pull
+  # request targeting another branch gets no CI at all, so a stacked series is
+  # unverified until each part is retargeted at main by the merge below it.
   pull_request:
-    branches: [main]
+  # A new advisory can land against an unchanged dependency tree, so the
+  # audit job also runs on a schedule rather than only on push.
+  schedule:
+    - cron: '0 6 * * 1'
 
 permissions:
   contents: read
@@ -19,5 +25,35 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt -- --check
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
+      # The system-trust-store build is not exercised by the default feature
+      # set, so it would otherwise only break for whoever needs it.
+      - run: cargo check --features native-certs
+
+  # Pins the toolchain named in Cargo.toml's rust-version so an accidental
+  # MSRV bump fails here instead of in a user's build.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  # This module is loaded into the PostgreSQL backend and makes the
+  # authentication decision, so a vulnerable dependency matters more than
+  # usual. Covers rustls, ring, quick-xml, chrono and ureq among others.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Vulnerabilities fail by default. `yanked` is added because a yanked
+      # dependency in a module that makes the auth decision is worth stopping
+      # for. `unsound` and `unmaintained` stay as warnings: the only current
+      # hits are tokio's AsyncFd (this crate uses no async) and
+      # rustls-pemfile (pulled in but not used on our path).
+      - run: cargo audit --deny yanked

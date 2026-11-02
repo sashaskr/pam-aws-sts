@@ -2,6 +2,9 @@
 name = "pam_aws_sts"
 version = "0.1.0"
 edition = "2021"
+# Verified against this toolchain in CI. The README promises 1.94+, and
+# nothing enforced it before, so an accidental bump could ship unnoticed.
+rust-version = "1.94"
 description = "PAM module for PostgreSQL authentication via AWS STS temporary credentials"
 license = "Apache-2.0"
 
@@ -36,8 +39,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toml = "0.8.23"
 
-# XML parsing for STS response
-quick-xml = "0.36.2"
+# XML parsing for STS response.
+# 0.41 is the first release carrying fixes for RUSTSEC-2026-0194 and
+# RUSTSEC-2026-0195 (quadratic attribute scanning and unbounded
+# namespace-declaration allocation).
+quick-xml = "0.41"
 
 # Security
 zeroize = { version = "1.9.0", features = ["derive"] }

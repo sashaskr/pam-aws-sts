@@ -28,10 +28,15 @@ jobs:
           cp config/pam.d/awssts dist/
           cp config/pg_hba.conf dist/
           tar czf pam_aws_sts-linux-amd64.tar.gz -C dist .
+          # Published so operators can verify what they are about to install
+          # as a root-loaded .so in their auth path.
+          sha256sum pam_aws_sts-linux-amd64.tar.gz > pam_aws_sts-linux-amd64.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: pam_aws_sts-linux-amd64
-          path: pam_aws_sts-linux-amd64.tar.gz
+          path: |
+            pam_aws_sts-linux-amd64.tar.gz
+            pam_aws_sts-linux-amd64.tar.gz.sha256
 
   build-debian-arm64:
     runs-on: ubuntu-24.04-arm
@@ -52,10 +57,13 @@ jobs:
           cp config/pam.d/awssts dist/
           cp config/pg_hba.conf dist/
           tar czf pam_aws_sts-linux-arm64.tar.gz -C dist .
+          sha256sum pam_aws_sts-linux-arm64.tar.gz > pam_aws_sts-linux-arm64.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: pam_aws_sts-linux-arm64
-          path: pam_aws_sts-linux-arm64.tar.gz
+          path: |
+            pam_aws_sts-linux-arm64.tar.gz
+            pam_aws_sts-linux-arm64.tar.gz.sha256
 
   build-al2023:
     runs-on: ubuntu-latest
@@ -78,10 +86,13 @@ jobs:
           cp config/pam.d/awssts dist/
           cp config/pg_hba.conf dist/
           tar czf pam_aws_sts-al2023-amd64.tar.gz -C dist .
+          sha256sum pam_aws_sts-al2023-amd64.tar.gz > pam_aws_sts-al2023-amd64.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: pam_aws_sts-al2023-amd64
-          path: pam_aws_sts-al2023-amd64.tar.gz
+          path: |
+            pam_aws_sts-al2023-amd64.tar.gz
+            pam_aws_sts-al2023-amd64.tar.gz.sha256
 
   build-el9:
     runs-on: ubuntu-latest
@@ -104,10 +115,13 @@ jobs:
           cp config/pam.d/awssts dist/
           cp config/pg_hba.conf dist/
           tar czf pam_aws_sts-el9-amd64.tar.gz -C dist .
+          sha256sum pam_aws_sts-el9-amd64.tar.gz > pam_aws_sts-el9-amd64.tar.gz.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: pam_aws_sts-el9-amd64
-          path: pam_aws_sts-el9-amd64.tar.gz
+          path: |
+            pam_aws_sts-el9-amd64.tar.gz
+            pam_aws_sts-el9-amd64.tar.gz.sha256
 
   publish:
     needs: [build-debian-amd64, build-debian-arm64, build-al2023, build-el9]
@@ -120,5 +134,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.tar.gz
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
           generate_release_notes: true
