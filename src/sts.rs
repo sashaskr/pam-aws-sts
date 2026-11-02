@@ -138,6 +138,32 @@ impl StsClient {
     }
 }
 
+const RESPONSE_ROOT: &str = "GetCallerIdentityResponse";
+const RESULT_ELEMENT: &str = "GetCallerIdentityResult";
+
+/// Records a field value, rejecting a second occurrence.
+///
+/// A genuine STS response carries each field exactly once. A duplicate means
+/// the document is not what we think it is, and silently letting the last one
+/// win would make which identity is used depend on element order.
+fn set_once(slot: &mut Option<String>, field: &str, value: String) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("duplicate <{}> in STS response", field));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// Extracts the caller identity from a `GetCallerIdentity` response.
+///
+/// Field recognition is anchored to the exact element path
+/// `GetCallerIdentityResponse/GetCallerIdentityResult/{Account,Arn,UserId}`.
+/// The previous implementation tracked only the most recent start tag and
+/// never cleared it on a closing tag, so it accepted these names from
+/// anywhere in the document and could attribute text to the wrong element
+/// when they were nested. Since the endpoint is operator-configurable and the
+/// identity decision rests entirely on this parse, the structure is checked
+/// rather than assumed.
 fn parse_get_caller_identity_response(xml: &str) -> Result<CallerIdentity, String> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
@@ -145,32 +171,83 @@ fn parse_get_caller_identity_response(xml: &str) -> Result<CallerIdentity, Strin
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
+    let mut path: Vec<String> = Vec::new();
+    let mut root: Option<String> = None;
+    let mut text_buf = String::new();
+
     let mut account = None;
     let mut arn = None;
     let mut user_id = None;
-    let mut current_element = String::new();
+    let mut error_code = None;
+    let mut error_message = None;
 
     loop {
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
-                current_element = String::from_utf8_lossy(e.name().as_ref()).to_string();
-            }
-            Ok(Event::Text(ref e)) => {
-                let text = e
-                    .unescape()
-                    .map_err(|e| format!("XML decode error: {}", e))?
-                    .to_string();
-                match current_element.as_str() {
-                    "Account" => account = Some(text),
-                    "Arn" => arn = Some(text),
-                    "UserId" => user_id = Some(text),
-                    _ => {}
+                // local_name() drops any namespace prefix.
+                let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                if path.is_empty() {
+                    root = Some(name.clone());
                 }
+                path.push(name);
+                text_buf.clear();
+            }
+            Ok(Event::Text(ref t)) => {
+                // Appended rather than assigned: a value can arrive as several
+                // text events when it contains entities.
+                let chunk = t
+                    .unescape()
+                    .map_err(|e| format!("XML decode error: {}", e))?;
+                text_buf.push_str(&chunk);
+            }
+            Ok(Event::CData(ref c)) => {
+                text_buf.push_str(&String::from_utf8_lossy(c.as_ref()));
+            }
+            Ok(Event::End(_)) => {
+                if path.len() == 3 {
+                    let value = std::mem::take(&mut text_buf);
+                    if path[0] == RESPONSE_ROOT && path[1] == RESULT_ELEMENT {
+                        match path[2].as_str() {
+                            "Account" => set_once(&mut account, "Account", value)?,
+                            "Arn" => set_once(&mut arn, "Arn", value)?,
+                            "UserId" => set_once(&mut user_id, "UserId", value)?,
+                            _ => {}
+                        }
+                    } else if path[0] == "ErrorResponse" && path[1] == "Error" {
+                        match path[2].as_str() {
+                            "Code" => error_code = Some(value),
+                            "Message" => error_message = Some(value),
+                            _ => {}
+                        }
+                    }
+                }
+                path.pop();
+                text_buf.clear();
             }
             Ok(Event::Eof) => break,
             Err(e) => return Err(format!("XML parse error: {}", e)),
             _ => {}
         }
+    }
+
+    // STS can return an error document with HTTP 200, so report it as an error
+    // rather than as a missing field.
+    if let Some(code) = error_code {
+        return Err(match error_message {
+            Some(message) => format!("STS error {}: {}", code, message),
+            None => format!("STS error {}", code),
+        });
+    }
+
+    match root.as_deref() {
+        Some(RESPONSE_ROOT) => {}
+        Some(other) => {
+            return Err(format!(
+                "unexpected STS response root element '{}' (expected {})",
+                other, RESPONSE_ROOT
+            ))
+        }
+        None => return Err("STS response contained no XML elements".into()),
     }
 
     Ok(CallerIdentity {
@@ -269,6 +346,142 @@ mod tests {
     #[test]
     fn parse_garbage() {
         assert!(parse_get_caller_identity_response("not xml {{}").is_err());
+    }
+
+    // --- structural hardening ---
+
+    fn wrap(inner: &str) -> String {
+        format!(
+            "<GetCallerIdentityResponse><GetCallerIdentityResult>{}\
+             </GetCallerIdentityResult></GetCallerIdentityResponse>",
+            inner
+        )
+    }
+
+    const GOOD_FIELDS: &str = "<Arn>arn:aws:sts::111122223333:assumed-role/R/s</Arn>\
+                               <UserId>AROAEXAMPLE:s</UserId>\
+                               <Account>111122223333</Account>";
+
+    #[test]
+    fn namespaced_elements_are_accepted() {
+        let xml = r#"<sts:GetCallerIdentityResponse xmlns:sts="https://sts.amazonaws.com/doc/2011-06-15/">
+  <sts:GetCallerIdentityResult>
+    <sts:Arn>arn:aws:sts::111122223333:assumed-role/R/s</sts:Arn>
+    <sts:UserId>AROAEXAMPLE:s</sts:UserId>
+    <sts:Account>111122223333</sts:Account>
+  </sts:GetCallerIdentityResult>
+</sts:GetCallerIdentityResponse>"#;
+        let id = parse_get_caller_identity_response(xml).unwrap();
+        assert_eq!(id.account, "111122223333");
+    }
+
+    // Previously these names were honored from anywhere in the document.
+    #[test]
+    fn fields_outside_the_result_element_are_ignored() {
+        let xml = r#"<GetCallerIdentityResponse>
+  <ResponseMetadata>
+    <Account>999999999999</Account>
+    <Arn>arn:aws:sts::999999999999:assumed-role/Attacker/s</Arn>
+    <UserId>AROAEVIL:s</UserId>
+  </ResponseMetadata>
+</GetCallerIdentityResponse>"#;
+        let err = parse_get_caller_identity_response(xml).unwrap_err();
+        assert!(err.contains("missing"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn stray_fields_do_not_override_the_real_ones() {
+        let xml = format!(
+            "<GetCallerIdentityResponse><GetCallerIdentityResult>{}\
+             </GetCallerIdentityResult>\
+             <ResponseMetadata><Account>999999999999</Account></ResponseMetadata>\
+             </GetCallerIdentityResponse>",
+            GOOD_FIELDS
+        );
+        let id = parse_get_caller_identity_response(&xml).unwrap();
+        assert_eq!(id.account, "111122223333");
+    }
+
+    #[test]
+    fn unexpected_root_element_rejected() {
+        let xml = format!(
+            "<SomethingElse><GetCallerIdentityResult>{}</GetCallerIdentityResult></SomethingElse>",
+            GOOD_FIELDS
+        );
+        let err = parse_get_caller_identity_response(&xml).unwrap_err();
+        assert!(
+            err.contains("unexpected STS response root element"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn duplicate_field_rejected() {
+        let xml = wrap(
+            "<Account>111122223333</Account><Arn>arn:aws:sts::111122223333:assumed-role/R/s</Arn>\
+             <UserId>U:s</UserId><Account>999999999999</Account>",
+        );
+        let err = parse_get_caller_identity_response(&xml).unwrap_err();
+        assert!(err.contains("duplicate <Account>"), "got: {}", err);
+    }
+
+    #[test]
+    fn error_response_reports_code_and_message() {
+        let xml = r#"<ErrorResponse><Error>
+            <Code>ExpiredTokenException</Code>
+            <Message>The security token included in the request is expired</Message>
+          </Error></ErrorResponse>"#;
+        let err = parse_get_caller_identity_response(xml).unwrap_err();
+        assert!(err.contains("ExpiredTokenException"), "got: {}", err);
+        assert!(err.contains("expired"), "got: {}", err);
+    }
+
+    #[test]
+    fn error_response_without_message_still_reports_code() {
+        let xml =
+            r#"<ErrorResponse><Error><Code>InvalidClientTokenId</Code></Error></ErrorResponse>"#;
+        let err = parse_get_caller_identity_response(xml).unwrap_err();
+        assert!(err.contains("InvalidClientTokenId"), "got: {}", err);
+    }
+
+    // A nested child used to leave current_element pointing at the child, so
+    // the parent's text was dropped or misattributed.
+    #[test]
+    fn nested_child_does_not_corrupt_the_parent_value() {
+        let xml = wrap(
+            "<Arn><Decoy>junk</Decoy>arn:aws:sts::111122223333:assumed-role/R/s</Arn>\
+             <UserId>AROAEXAMPLE:s</UserId><Account>111122223333</Account>",
+        );
+        let id = parse_get_caller_identity_response(&xml).unwrap();
+        assert_eq!(id.arn, "arn:aws:sts::111122223333:assumed-role/R/s");
+    }
+
+    #[test]
+    fn entity_escaped_value_is_reassembled() {
+        let xml = wrap(
+            "<Arn>arn:aws:sts::111122223333:assumed-role/My&amp;Role/s</Arn>\
+             <UserId>U:s</UserId><Account>111122223333</Account>",
+        );
+        let id = parse_get_caller_identity_response(&xml).unwrap();
+        assert_eq!(id.arn, "arn:aws:sts::111122223333:assumed-role/My&Role/s");
+    }
+
+    #[test]
+    fn cdata_value_is_read() {
+        let xml = wrap(
+            "<Arn><![CDATA[arn:aws:sts::111122223333:assumed-role/R/s]]></Arn>\
+             <UserId>U:s</UserId><Account>111122223333</Account>",
+        );
+        let id = parse_get_caller_identity_response(&xml).unwrap();
+        assert_eq!(id.arn, "arn:aws:sts::111122223333:assumed-role/R/s");
+    }
+
+    #[test]
+    fn empty_response_body_rejected() {
+        assert!(parse_get_caller_identity_response("")
+            .unwrap_err()
+            .contains("no XML elements"));
     }
 
     #[test]
