@@ -8,6 +8,17 @@ license = "Apache-2.0"
 [lib]
 crate-type = ["cdylib", "lib"]
 
+[features]
+default = []
+# Validate STS TLS against the operating system trust store instead of the
+# Mozilla root set compiled into the module by `webpki-roots`.
+#
+# The bundled roots mean the host's CA policy is ignored: root updates and
+# revocations need a rebuild, and an environment that terminates egress TLS on
+# an inspecting proxy with a private CA cannot work at all. Build with
+# `--features native-certs` in those environments.
+native-certs = ["ureq/native-certs"]
+
 [dependencies]
 # AWS SigV4 signing
 aws-sigv4 = "1.5.1"

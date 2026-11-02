@@ -161,6 +161,19 @@ docker compose up -d builder
 ./scripts/build.sh
 ```
 
+### TLS trust store
+
+By default the module validates the STS certificate against the Mozilla root
+set compiled in via `webpki-roots`. The host's own CA configuration is ignored,
+which means root updates need a rebuild and an environment that terminates
+egress TLS on an inspecting proxy with a private CA will fail to connect.
+
+Build against the operating system trust store instead:
+
+```bash
+cargo build --release --features native-certs
+```
+
 ## Development setup
 
 ```bash
@@ -180,6 +193,7 @@ docker compose up -d          # vanilla postgres + rust builder
 | | `allowed_account_ids` | Account IDs accepted (array) |
 | | `sts_endpoint` | Optional override. Must be `https://`. Omit to derive from `region` |
 | | `allow_insecure_endpoint` | Permit a plaintext `http://` endpoint. Local mocks only (default: false) |
+| | `use_fips_endpoint` | Use `sts-fips.<region>.<domain>` (default: false) |
 | | `timeout_secs` | HTTP timeout, 1–30 (default: 5) |
 | | `grace_period_secs` | Reject tokens expiring within this window (default: 30). Client-asserted; see note below |
 | | `require_expiration` | Reject credentials with no `Expiration` field (default: false) |
