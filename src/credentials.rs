@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[derive(Debug, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct StsCredentials {
     #[serde(rename = "AccessKeyId")]
     pub access_key_id: String,
@@ -16,6 +17,30 @@ pub struct StsCredentials {
     #[serde(rename = "Expiration")]
     #[zeroize(skip)]
     pub expiration: Option<String>,
+}
+
+/// Hand-written so that `{:?}` can never print live credentials.
+///
+/// This impl is deliberately not derived. A derived `Debug` renders
+/// `secret_access_key` and `session_token` verbatim, which means any
+/// `{:?}` of this value writes usable AWS credentials wherever it lands.
+/// That includes paths nobody writes on purpose: a `Debug` derived on some
+/// future wrapper type, a `Result<StsCredentials, _>` in an `.unwrap()`
+/// panic message, or a tracing macro added later.
+///
+/// `access_key_id` is retained. An `ASIA...` key id is an identifier rather
+/// than a secret, and it is the field needed to correlate a failed login
+/// with a CloudTrail event. This mirrors what the AWS SDK's own
+/// `aws_credential_types::Credentials` chooses to show and hide.
+impl fmt::Debug for StsCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StsCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"** redacted **")
+            .field("session_token", &"** redacted **")
+            .field("expiration", &self.expiration)
+            .finish()
+    }
 }
 
 impl StsCredentials {
@@ -216,5 +241,76 @@ mod tests {
         let json = r#"{"AccessKeyId":"a","SecretAccessKey":"s","SessionToken":"t","Expiration":"2099-12-31T23:59:59Z"}"#;
         let creds = StsCredentials::from_json(json).unwrap();
         assert!(creds.check_expiration(0).is_ok());
+    }
+
+    const SECRET: &str = "wJalrXUtnFEMI-UNIQUE-SECRET-MARKER";
+    const TOKEN: &str = "FwoGZXIvYXdz-UNIQUE-TOKEN-MARKER";
+
+    fn creds_with_markers() -> StsCredentials {
+        let json = format!(
+            r#"{{"AccessKeyId":"ASIAEXAMPLE","SecretAccessKey":"{}","SessionToken":"{}","Expiration":"2099-01-01T00:00:00Z"}}"#,
+            SECRET, TOKEN
+        );
+        StsCredentials::from_json(&json).unwrap()
+    }
+
+    #[test]
+    fn debug_does_not_expose_secret_access_key() {
+        let rendered = format!("{:?}", creds_with_markers());
+        assert!(
+            !rendered.contains(SECRET),
+            "secret access key leaked into Debug output: {}",
+            rendered
+        );
+        assert!(rendered.contains("** redacted **"));
+    }
+
+    #[test]
+    fn debug_does_not_expose_session_token() {
+        let rendered = format!("{:?}", creds_with_markers());
+        assert!(
+            !rendered.contains(TOKEN),
+            "session token leaked into Debug output: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn debug_keeps_access_key_id_for_cloudtrail_correlation() {
+        let rendered = format!("{:?}", creds_with_markers());
+        assert!(rendered.contains("ASIAEXAMPLE"));
+    }
+
+    // The leak that matters is rarely a direct `{:?}` on this type; it is a
+    // derived Debug on something that happens to contain it. Redacting in the
+    // inner impl is what makes those paths safe too.
+    #[test]
+    fn debug_stays_redacted_when_nested_in_other_types() {
+        let nested = Some((1u8, creds_with_markers()));
+        let rendered = format!("{:?}", nested);
+        assert!(
+            !rendered.contains(SECRET),
+            "leaked via nesting: {}",
+            rendered
+        );
+        assert!(
+            !rendered.contains(TOKEN),
+            "leaked via nesting: {}",
+            rendered
+        );
+
+        let as_result: Result<StsCredentials, &str> = Ok(creds_with_markers());
+        let rendered = format!("{:?}", as_result);
+        assert!(
+            !rendered.contains(SECRET),
+            "leaked via Result: {}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn debug_still_renders_expiration() {
+        let rendered = format!("{:?}", creds_with_markers());
+        assert!(rendered.contains("2099-01-01T00:00:00Z"));
     }
 }
