@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # Deliberately not filtered to `branches: [main]`. With that filter a pull
+  # request targeting another branch gets no CI at all, so a stacked series is
+  # unverified until each part is retargeted at main by the merge below it.
   pull_request:
-    branches: [main]
   # A new advisory can land against an unchanged dependency tree, so the
   # audit job also runs on a schedule rather than only on push.
   schedule:
