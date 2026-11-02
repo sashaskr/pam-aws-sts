@@ -6,10 +6,50 @@ use std::path::Path;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub aws: AwsConfig,
-    pub role_mapping: HashMap<String, Vec<String>>,
+    pub role_mapping: RoleMapping,
     #[serde(default)]
     #[allow(dead_code)]
     pub logging: LoggingConfig,
+}
+
+/// How IAM roles map to PostgreSQL usernames.
+///
+/// Two shapes are accepted. The account-scoped shape is the safe one:
+///
+/// ```toml
+/// [role_mapping."111122223333"]
+/// "AdminRole" = ["dbadmin"]
+/// ```
+///
+/// The flat shape keys on role name alone and is kept for single-account
+/// configs, which are unambiguous:
+///
+/// ```toml
+/// [role_mapping]
+/// "AdminRole" = ["dbadmin"]
+/// ```
+///
+/// A flat mapping combined with more than one allowed account is rejected at
+/// load. IAM guarantees role names are unique only *within* an account, so in
+/// that combination a role named `AdminRole` in any allowed account resolves
+/// to the same PostgreSQL user. Whoever can create a role in the least trusted
+/// allowed account would inherit the privileges of the most trusted one.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RoleMapping {
+    /// account id -> role name -> allowed PostgreSQL usernames
+    PerAccount(HashMap<String, HashMap<String, Vec<String>>>),
+    /// role name -> allowed PostgreSQL usernames
+    Flat(HashMap<String, Vec<String>>),
+}
+
+impl RoleMapping {
+    fn is_empty(&self) -> bool {
+        match self {
+            RoleMapping::PerAccount(m) => m.is_empty() || m.values().all(|r| r.is_empty()),
+            RoleMapping::Flat(m) => m.is_empty(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,8 +166,55 @@ impl Config {
         if let Some(endpoint) = &config.aws.sts_endpoint {
             validate_sts_endpoint(endpoint, config.aws.allow_insecure_endpoint)?;
         }
+        config.validate_role_mapping()?;
 
         Ok(config)
+    }
+
+    /// Rejects a role mapping that cannot express the operator's intent safely.
+    fn validate_role_mapping(&self) -> Result<(), String> {
+        match &self.role_mapping {
+            RoleMapping::Flat(_) if self.aws.allowed_account_ids.len() > 1 => Err(format!(
+                "role_mapping keys on role name alone, but {} accounts are allowed. \
+                 IAM role names are unique only within an account, so a role named \
+                 the same thing in any allowed account would map to the same \
+                 PostgreSQL user. Scope the mapping by account instead:\n\n\
+                 [role_mapping.\"{}\"]\n\"MyRole\" = [\"dbadmin\"]",
+                self.aws.allowed_account_ids.len(),
+                self.aws.allowed_account_ids[0]
+            )),
+            RoleMapping::PerAccount(per_account) => {
+                // A mapping for an account that is not allowed can never match.
+                // Failing here is deliberate: a silently dead authorization rule
+                // reads like a granted permission.
+                for account in per_account.keys() {
+                    if !self.aws.allowed_account_ids.contains(account) {
+                        return Err(format!(
+                            "role_mapping has an entry for account '{}', which is not in \
+                             aws.allowed_account_ids. That mapping could never match. \
+                             Add the account to allowed_account_ids or remove the mapping.",
+                            account
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            RoleMapping::Flat(_) => Ok(()),
+        }
+    }
+
+    /// Returns the PostgreSQL usernames the given account and role may log in as.
+    ///
+    /// For a flat mapping the account is ignored, which is sound only because
+    /// `validate_role_mapping` has already established that exactly one account
+    /// is allowed and `validate_identity` has already matched it.
+    pub fn allowed_users_for(&self, account: &str, role: &str) -> Option<&[String]> {
+        match &self.role_mapping {
+            RoleMapping::PerAccount(per_account) => {
+                per_account.get(account)?.get(role).map(Vec::as_slice)
+            }
+            RoleMapping::Flat(flat) => flat.get(role).map(Vec::as_slice),
+        }
     }
 
     #[allow(dead_code)]
@@ -166,8 +253,10 @@ facility = "auth"
         assert_eq!(config.aws.timeout_secs, 5);
         assert_eq!(config.aws.grace_period_secs, Some(30));
         assert_eq!(
-            config.role_mapping.get("YubiKeyKMSRole").unwrap(),
-            &vec!["pg_admin".to_string()]
+            config
+                .allowed_users_for("111122223333", "YubiKeyKMSRole")
+                .unwrap(),
+            ["pg_admin".to_string()]
         );
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.facility, "auth");
@@ -344,22 +433,135 @@ allowed_account_ids = ["123456789012"]
         let toml = r#"
 [aws]
 region = "eu-central-1"
-allowed_account_ids = ["111122223333", "444455556666"]
+allowed_account_ids = ["111122223333"]
 
 [role_mapping]
 "AdminRole" = ["admin", "superuser"]
 "ViewerRole" = ["viewer"]
 "#;
         let config = Config::from_str(toml).unwrap();
-        assert_eq!(config.aws.allowed_account_ids.len(), 2);
         assert_eq!(
-            config.role_mapping.get("AdminRole").unwrap(),
-            &vec!["admin".to_string(), "superuser".to_string()]
+            config
+                .allowed_users_for("111122223333", "AdminRole")
+                .unwrap(),
+            ["admin".to_string(), "superuser".to_string()]
         );
         assert_eq!(
-            config.role_mapping.get("ViewerRole").unwrap(),
-            &vec!["viewer".to_string()]
+            config
+                .allowed_users_for("111122223333", "ViewerRole")
+                .unwrap(),
+            ["viewer".to_string()]
         );
+    }
+
+    // --- role mapping shape and scoping ---
+
+    #[test]
+    fn flat_mapping_with_multiple_accounts_is_rejected() {
+        let toml = r#"
+[aws]
+region = "eu-central-1"
+allowed_account_ids = ["111122223333", "444455556666"]
+
+[role_mapping]
+"AdminRole" = ["admin"]
+"#;
+        let err = Config::from_str(toml).unwrap_err();
+        assert!(
+            err.contains("unique only within an account"),
+            "unexpected error: {}",
+            err
+        );
+        // The message should show the operator the shape to migrate to.
+        assert!(err.contains("[role_mapping."));
+    }
+
+    #[test]
+    fn per_account_mapping_parses() {
+        let toml = r#"
+[aws]
+region = "eu-central-1"
+allowed_account_ids = ["111122223333", "444455556666"]
+
+[role_mapping."111122223333"]
+"AdminRole" = ["dbadmin"]
+
+[role_mapping."444455556666"]
+"AdminRole" = ["readonly"]
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert_eq!(
+            config
+                .allowed_users_for("111122223333", "AdminRole")
+                .unwrap(),
+            ["dbadmin".to_string()]
+        );
+        // Same role name, different account, different user. This is the whole
+        // point of scoping the mapping.
+        assert_eq!(
+            config
+                .allowed_users_for("444455556666", "AdminRole")
+                .unwrap(),
+            ["readonly".to_string()]
+        );
+    }
+
+    #[test]
+    fn per_account_lookup_misses_for_unmapped_account() {
+        let toml = r#"
+[aws]
+region = "eu-central-1"
+allowed_account_ids = ["111122223333", "444455556666"]
+
+[role_mapping."111122223333"]
+"AdminRole" = ["dbadmin"]
+
+[role_mapping."444455556666"]
+"OtherRole" = ["x"]
+"#;
+        let config = Config::from_str(toml).unwrap();
+        assert!(config
+            .allowed_users_for("444455556666", "AdminRole")
+            .is_none());
+        assert!(config
+            .allowed_users_for("999999999999", "AdminRole")
+            .is_none());
+    }
+
+    #[test]
+    fn per_account_mapping_for_disallowed_account_is_rejected() {
+        let toml = r#"
+[aws]
+region = "eu-central-1"
+allowed_account_ids = ["111122223333"]
+
+[role_mapping."999999999999"]
+"AdminRole" = ["dbadmin"]
+"#;
+        let err = Config::from_str(toml).unwrap_err();
+        assert!(
+            err.contains("could never match"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn flat_mapping_with_one_account_still_accepted() {
+        let config = Config::from_str(VALID_CONFIG).unwrap();
+        assert!(matches!(config.role_mapping, RoleMapping::Flat(_)));
+    }
+
+    #[test]
+    fn empty_per_account_mapping_rejected() {
+        let toml = r#"
+[aws]
+region = "eu-central-1"
+allowed_account_ids = ["111122223333"]
+
+[role_mapping."111122223333"]
+"#;
+        assert!(Config::from_str(toml).unwrap_err().contains("role_mapping"));
     }
 
     #[test]

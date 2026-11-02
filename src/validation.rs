@@ -15,10 +15,18 @@ pub fn validate_identity(
 
     let role_name = extract_role_name(&identity.arn)?;
 
+    // Scoped by account, not role name alone. IAM guarantees role name
+    // uniqueness only within an account, so with several allowed accounts a
+    // bare role-name lookup would let a role in the least trusted account
+    // resolve to a mapping intended for the most trusted one.
     let allowed_users = config
-        .role_mapping
-        .get(&role_name)
-        .ok_or_else(|| format!("role '{}' has no mapping in config", role_name))?;
+        .allowed_users_for(&identity.account, &role_name)
+        .ok_or_else(|| {
+            format!(
+                "role '{}' in account '{}' has no mapping in config",
+                role_name, identity.account
+            )
+        })?;
 
     if !allowed_users.iter().any(|u| u == pam_username) {
         return Err(format!(
@@ -227,5 +235,92 @@ allowed_account_ids = ["111122223333"]
     #[test]
     fn extract_federated_user_rejected() {
         assert!(extract_role_name("arn:aws:sts::123:federated-user/alice").is_err());
+    }
+
+    // --- account-scoped mapping ---
+
+    fn multi_account_cfg() -> Config {
+        Config::from_str(
+            r#"
+[aws]
+region = "us-east-1"
+allowed_account_ids = ["111122223333", "444455556666"]
+
+[role_mapping."111122223333"]
+"AdminRole" = ["dbadmin"]
+
+[role_mapping."444455556666"]
+"ReportingRole" = ["analyst"]
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn per_account_mapping_allows_its_own_account() {
+        let c = multi_account_cfg();
+        let i = id(
+            "111122223333",
+            "arn:aws:sts::111122223333:assumed-role/AdminRole/s",
+        );
+        assert!(validate_identity("dbadmin", &i, &c).is_ok());
+    }
+
+    // The privilege escalation this change exists to prevent: the same role
+    // name in a different allowed account must not inherit the mapping.
+    #[test]
+    fn same_role_name_in_another_allowed_account_is_rejected() {
+        let c = multi_account_cfg();
+        let i = id(
+            "444455556666",
+            "arn:aws:sts::444455556666:assumed-role/AdminRole/s",
+        );
+        let err = validate_identity("dbadmin", &i, &c).unwrap_err();
+        assert!(
+            err.contains("no mapping"),
+            "AdminRole in account 444455556666 must not reach the 111122223333 \
+             mapping, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn per_account_mapping_is_not_cross_wired() {
+        let c = multi_account_cfg();
+        // analyst is mapped in 444455556666, not in 111122223333
+        let i = id(
+            "111122223333",
+            "arn:aws:sts::111122223333:assumed-role/ReportingRole/s",
+        );
+        assert!(validate_identity("analyst", &i, &c).is_err());
+
+        let i = id(
+            "444455556666",
+            "arn:aws:sts::444455556666:assumed-role/ReportingRole/s",
+        );
+        assert!(validate_identity("analyst", &i, &c).is_ok());
+    }
+
+    #[test]
+    fn disallowed_account_still_rejected_before_mapping_lookup() {
+        let c = multi_account_cfg();
+        let i = id(
+            "999999999999",
+            "arn:aws:sts::999999999999:assumed-role/AdminRole/s",
+        );
+        assert!(validate_identity("dbadmin", &i, &c)
+            .unwrap_err()
+            .contains("not in allowed_account_ids"));
+    }
+
+    // Single account plus flat mapping stays supported and unambiguous.
+    #[test]
+    fn flat_mapping_still_works_for_single_account() {
+        let c = cfg();
+        let i = id(
+            "111122223333",
+            "arn:aws:sts::111122223333:assumed-role/AdminRole/s",
+        );
+        assert!(validate_identity("dbadmin", &i, &c).is_ok());
     }
 }
