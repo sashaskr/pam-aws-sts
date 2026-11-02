@@ -13,7 +13,7 @@ You run PostgreSQL on bare metal, EC2, or Docker — not RDS. You want IAM-based
 
 - Centralized access control via IAM roles
 - No static database passwords
-- Audit trail (who connected, which IAM role, when)
+- Audit trail in syslog (who connected, which IAM role, from which address, when)
 - Works with any source of STS credentials
 
 Good fit for organizations migrating from on-premise to the AWS ecosystem incrementally — your PostgreSQL stays where it is, but auth moves to IAM.

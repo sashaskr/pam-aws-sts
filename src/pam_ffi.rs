@@ -1,5 +1,5 @@
-use crate::logging::PamLogger;
-use crate::{authenticate, AuthResult};
+use crate::config::{DEFAULT_LOG_FACILITY, DEFAULT_LOG_LEVEL};
+use crate::{authenticate_from, init_logging, AuthResult};
 use libc::{c_char, c_int, c_void, free};
 use std::ffi::{CStr, CString};
 use std::panic::{self, AssertUnwindSafe};
@@ -12,6 +12,9 @@ const PAM_CRED_INSUFFICIENT: c_int = 8;
 const PAM_AUTHINFO_UNAVAIL: c_int = 9;
 const PAM_CONV: c_int = 5;
 const PAM_USER: c_int = 2;
+/// Client address or hostname. PostgreSQL sets this via `pam_set_item`; which
+/// of the two it contains depends on the `pam_use_hostname` HBA option.
+const PAM_RHOST: c_int = 4;
 const PAM_PROMPT_ECHO_OFF: c_int = 1;
 
 #[repr(C)]
@@ -215,12 +218,21 @@ unsafe fn authenticate_impl(
     argv: *const *const c_char,
 ) -> c_int {
     let config_path = parse_config_path(argc, argv);
-    PamLogger::init("info", "auth");
+
+    // Optional. PostgreSQL sets PAM_RHOST for TCP connections but not for the
+    // local socket, and another PAM application may not set it at all.
+    let rhost = get_pam_item_str(pamh, PAM_RHOST).ok();
 
     let username = match get_pam_item_str(pamh, PAM_USER) {
         Ok(u) => u,
         Err(code) => {
-            log::error!("failed to get PAM username");
+            // The configured log level is not known yet, so fall back to the
+            // defaults purely so this failure is not silently dropped.
+            init_logging(DEFAULT_LOG_LEVEL, DEFAULT_LOG_FACILITY);
+            log::error!(
+                "failed to get PAM username (source='{}')",
+                rhost.as_deref().unwrap_or("local")
+            );
             return code;
         }
     };
@@ -231,12 +243,17 @@ unsafe fn authenticate_impl(
     let password = match get_password_via_conv(pamh) {
         Ok(p) => Zeroizing::new(p),
         Err(code) => {
-            log::error!("failed to get password for '{}'", username);
+            init_logging(DEFAULT_LOG_LEVEL, DEFAULT_LOG_FACILITY);
+            log::error!(
+                "failed to get password for '{}' (source='{}')",
+                username,
+                rhost.as_deref().unwrap_or("local")
+            );
             return code;
         }
     };
 
-    match authenticate(&username, password.as_str(), &config_path) {
+    match authenticate_from(&username, password.as_str(), &config_path, rhost.as_deref()) {
         AuthResult::Success => PAM_SUCCESS,
         AuthResult::InvalidCredentials(_) => PAM_AUTH_ERR,
         AuthResult::Error(_) => PAM_AUTHINFO_UNAVAIL,
