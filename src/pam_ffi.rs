@@ -4,9 +4,11 @@ use libc::{c_char, c_int, c_void, free};
 use std::ffi::{CStr, CString};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, Ordering};
 use zeroize::Zeroizing;
 
 const PAM_SUCCESS: c_int = 0;
+const PAM_PERM_DENIED: c_int = 6;
 const PAM_AUTH_ERR: c_int = 7;
 const PAM_CRED_INSUFFICIENT: c_int = 8;
 const PAM_AUTHINFO_UNAVAIL: c_int = 9;
@@ -16,6 +18,38 @@ const PAM_USER: c_int = 2;
 /// of the two it contains depends on the `pam_use_hostname` HBA option.
 const PAM_RHOST: c_int = 4;
 const PAM_PROMPT_ECHO_OFF: c_int = 1;
+
+/// Set when `pam_sm_authenticate` approved the current PAM transaction.
+///
+/// PostgreSQL forks a backend per connection and calls `pam_authenticate`
+/// then `pam_acct_mgmt` within that single process (see `CheckPAMAuth` in
+/// `src/backend/libpq/auth.c`), so process-local state is transaction-local
+/// state in this deployment. The flag is consumed when read, so one approval
+/// cannot satisfy two account checks.
+///
+/// This is why the state is not kept with `pam_set_data`: that would add raw
+/// pointer handling and a cleanup callback to the FFI surface for no gain in
+/// the single-transaction-per-process model this module targets.
+static AUTHENTICATED: AtomicBool = AtomicBool::new(false);
+
+fn mark_authenticated() {
+    AUTHENTICATED.store(true, Ordering::SeqCst);
+}
+
+/// Returns whether this module authenticated the transaction, clearing the flag.
+fn take_authenticated() -> bool {
+    AUTHENTICATED.swap(false, Ordering::SeqCst)
+}
+
+/// Maps the account-phase decision. Separated out so it is testable without
+/// touching the process-wide flag.
+fn account_decision(was_authenticated: bool) -> c_int {
+    if was_authenticated {
+        PAM_SUCCESS
+    } else {
+        PAM_PERM_DENIED
+    }
+}
 
 #[repr(C)]
 pub struct PamHandle {
@@ -254,12 +288,26 @@ unsafe fn authenticate_impl(
     };
 
     match authenticate_from(&username, password.as_str(), &config_path, rhost.as_deref()) {
-        AuthResult::Success => PAM_SUCCESS,
+        AuthResult::Success => {
+            mark_authenticated();
+            PAM_SUCCESS
+        }
         AuthResult::InvalidCredentials(_) => PAM_AUTH_ERR,
         AuthResult::Error(_) => PAM_AUTHINFO_UNAVAIL,
     }
 }
 
+/// Account phase: confirms that this module is the one that authenticated.
+///
+/// PostgreSQL always calls `pam_acct_mgmt` after `pam_authenticate`, and the
+/// shipped PAM service lists this module for both. Previously this returned
+/// `PAM_SUCCESS` unconditionally, which made the `account required` line
+/// decorative: it would approve a transaction authenticated by some other
+/// module, or by nothing at all.
+///
+/// There is no credential available in this phase to re-verify against STS,
+/// so the meaningful check is that the auth phase of this module ran and
+/// succeeded for this transaction.
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_acct_mgmt(
     _pamh: *const PamHandle,
@@ -267,7 +315,17 @@ pub unsafe extern "C" fn pam_sm_acct_mgmt(
     _argc: c_int,
     _argv: *const *const c_char,
 ) -> c_int {
-    guarded("pam_sm_acct_mgmt", || PAM_SUCCESS)
+    guarded("pam_sm_acct_mgmt", || {
+        let decision = account_decision(take_authenticated());
+        if decision != PAM_SUCCESS {
+            log::warn!(
+                "account check denied: pam_aws_sts did not authenticate this \
+                 transaction. The PAM service must list \
+                 'auth required pam_aws_sts.so' alongside the account entry."
+            );
+        }
+        decision
+    })
 }
 
 #[no_mangle]
@@ -330,6 +388,29 @@ mod tests {
             })
         });
         assert_eq!(code, PAM_AUTHINFO_UNAVAIL);
+    }
+
+    #[test]
+    fn account_phase_denies_when_auth_did_not_run() {
+        assert_eq!(account_decision(false), PAM_PERM_DENIED);
+    }
+
+    #[test]
+    fn account_phase_allows_after_successful_auth() {
+        assert_eq!(account_decision(true), PAM_SUCCESS);
+    }
+
+    // Single test for the process-wide flag: Rust runs tests as threads in one
+    // process, so exercising the static from more than one test would race.
+    #[test]
+    fn authenticated_flag_is_set_then_consumed() {
+        assert!(!take_authenticated(), "flag should start clear");
+        mark_authenticated();
+        assert!(take_authenticated(), "flag should report the approval");
+        assert!(
+            !take_authenticated(),
+            "approval must be single-use so it cannot satisfy a second account check"
+        );
     }
 
     #[test]
