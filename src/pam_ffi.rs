@@ -2,8 +2,9 @@ use crate::logging::PamLogger;
 use crate::{authenticate, AuthResult};
 use libc::{c_char, c_int, c_void, free};
 use std::ffi::{CStr, CString};
+use std::panic::{self, AssertUnwindSafe};
 use std::ptr::{self, NonNull};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 const PAM_SUCCESS: c_int = 0;
 const PAM_AUTH_ERR: c_int = 7;
@@ -138,10 +139,45 @@ fn parse_config_path(argc: c_int, argv: *const *const c_char) -> String {
     default_path.to_string()
 }
 
+/// Runs the body of a PAM entry point, converting a panic into a denial.
+///
+/// A panic that escapes an `extern "C"` function aborts the process rather
+/// than unwinding into the C caller. This module is loaded into the
+/// PostgreSQL *backend*, and the postmaster responds to a crashed backend by
+/// terminating every other backend and entering recovery. Without this guard,
+/// one panic in authentication code is a cluster-wide outage instead of a
+/// single failed login.
+///
+/// Failing closed is the only safe choice here: a panic means an invariant we
+/// relied on did not hold, so the identity decision cannot be trusted.
+fn guarded(entry: &'static str, body: impl FnOnce() -> c_int) -> c_int {
+    match panic::catch_unwind(AssertUnwindSafe(body)) {
+        Ok(code) => code,
+        Err(_) => {
+            // Best effort reporting only. The logger may itself be what
+            // panicked, so a failure to report must not escalate to an abort.
+            let _ = panic::catch_unwind(|| {
+                log::error!("{}: caught panic, denying authentication", entry);
+            });
+            PAM_AUTHINFO_UNAVAIL
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pam_sm_authenticate(
     pamh: *const PamHandle,
     _flags: c_int,
+    argc: c_int,
+    argv: *const *const c_char,
+) -> c_int {
+    guarded("pam_sm_authenticate", || unsafe {
+        authenticate_impl(pamh, argc, argv)
+    })
+}
+
+unsafe fn authenticate_impl(
+    pamh: *const PamHandle,
     argc: c_int,
     argv: *const *const c_char,
 ) -> c_int {
@@ -156,20 +192,18 @@ pub unsafe extern "C" fn pam_sm_authenticate(
         }
     };
 
-    let mut password = match get_password_via_conv(pamh) {
-        Ok(p) => p,
+    // Held in Zeroizing so the secret is scrubbed on the unwinding path as
+    // well as on normal return. A plain String would be freed without being
+    // overwritten if anything below panicked.
+    let password = match get_password_via_conv(pamh) {
+        Ok(p) => Zeroizing::new(p),
         Err(code) => {
             log::error!("failed to get password for '{}'", username);
             return code;
         }
     };
 
-    let result = authenticate(&username, &password, &config_path);
-
-    // Zeroize the password copy in Rust memory
-    password.zeroize();
-
-    match result {
+    match authenticate(&username, password.as_str(), &config_path) {
         AuthResult::Success => PAM_SUCCESS,
         AuthResult::InvalidCredentials(_) => PAM_AUTH_ERR,
         AuthResult::Error(_) => PAM_AUTHINFO_UNAVAIL,
@@ -183,7 +217,7 @@ pub unsafe extern "C" fn pam_sm_acct_mgmt(
     _argc: c_int,
     _argv: *const *const c_char,
 ) -> c_int {
-    PAM_SUCCESS
+    guarded("pam_sm_acct_mgmt", || PAM_SUCCESS)
 }
 
 #[no_mangle]
@@ -193,7 +227,7 @@ pub unsafe extern "C" fn pam_sm_setcred(
     _argc: c_int,
     _argv: *const *const c_char,
 ) -> c_int {
-    PAM_SUCCESS
+    guarded("pam_sm_setcred", || PAM_SUCCESS)
 }
 
 #[cfg(test)]
@@ -203,5 +237,64 @@ mod tests {
     #[test]
     fn default_config_path() {
         assert_eq!(parse_config_path(0, ptr::null()), "/etc/pam_aws_sts.toml");
+    }
+
+    /// Runs `f` with the panic hook silenced, so a deliberately panicking test
+    /// does not print a backtrace and look like a failure.
+    fn without_panic_output<T>(f: impl FnOnce() -> T) -> T {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+        let out = f();
+        panic::set_hook(previous);
+        out
+    }
+
+    #[test]
+    fn guarded_passes_through_success() {
+        assert_eq!(guarded("t", || PAM_SUCCESS), PAM_SUCCESS);
+    }
+
+    #[test]
+    fn guarded_passes_through_denial() {
+        assert_eq!(guarded("t", || PAM_AUTH_ERR), PAM_AUTH_ERR);
+    }
+
+    #[test]
+    fn guarded_converts_panic_into_denial() {
+        let code = without_panic_output(|| guarded("t", || panic!("boom")));
+        assert_eq!(
+            code, PAM_AUTHINFO_UNAVAIL,
+            "a panic must deny, never return PAM_SUCCESS"
+        );
+    }
+
+    // The specific shape that used to abort the backend: slicing a str at a
+    // non-char boundary deep inside the STS error path.
+    #[test]
+    fn guarded_contains_char_boundary_panic() {
+        let code = without_panic_output(|| {
+            guarded("t", || {
+                let s = format!("{}\u{2014}", "x".repeat(199));
+                let _ = &s[..200];
+                PAM_SUCCESS
+            })
+        });
+        assert_eq!(code, PAM_AUTHINFO_UNAVAIL);
+    }
+
+    #[test]
+    fn guarded_never_returns_success_on_panic() {
+        for payload in ["str", "owned"] {
+            let code = without_panic_output(|| {
+                guarded("t", || {
+                    if payload == "str" {
+                        panic!("static str payload")
+                    } else {
+                        panic!("{}", String::from("owned payload"))
+                    }
+                })
+            });
+            assert_ne!(code, PAM_SUCCESS);
+        }
     }
 }

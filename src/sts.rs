@@ -180,12 +180,22 @@ fn parse_get_caller_identity_response(xml: &str) -> Result<CallerIdentity, Strin
     })
 }
 
+/// Truncates `s` to at most `max_len` **bytes** without splitting a character.
+///
+/// Slicing a `str` at an index that is not a character boundary panics. This
+/// function is applied to STS error bodies, which are remote input, so a naive
+/// `&s[..max_len]` is reachable by anything that returns a non-ASCII error
+/// page (a proxy, a WAF, a localized gateway message). A panic here aborts the
+/// PostgreSQL backend, so the boundary is walked back instead.
 fn truncate(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
-        s
-    } else {
-        &s[..max_len]
+        return s;
     }
+    let mut end = max_len;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[cfg(test)]
@@ -274,5 +284,41 @@ mod tests {
     #[test]
     fn truncate_exact() {
         assert_eq!(truncate("exact", 5), "exact");
+    }
+
+    // Regression: this input previously panicked with
+    // "byte index 200 is not a char boundary".
+    #[test]
+    fn truncate_does_not_split_multibyte_char() {
+        let mut body = "x".repeat(199);
+        body.push('\u{2014}'); // em dash, 3 bytes spanning indices 199..202
+        body.push_str(&"y".repeat(50));
+
+        let out = truncate(&body, 200);
+        assert_eq!(out.len(), 199, "should stop before the multibyte char");
+        assert!(out.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn truncate_handles_all_multibyte() {
+        // Every char is 4 bytes, so no boundary lands on an odd index.
+        let body = "\u{1F600}".repeat(10); // 40 bytes
+        assert_eq!(truncate(&body, 7).len(), 4);
+        assert_eq!(truncate(&body, 4).len(), 4);
+        assert_eq!(truncate(&body, 3).len(), 0);
+    }
+
+    #[test]
+    fn truncate_zero_len() {
+        assert_eq!(truncate("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_realistic_sts_error_body_is_not_a_panic() {
+        // A localized or proxy-generated error page reaching the >200 byte path.
+        let body = format!("<html><body>{}</body></html>", "é".repeat(400));
+        let out = truncate(&body, 200);
+        assert!(out.len() <= 200);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 }
