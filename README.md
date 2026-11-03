@@ -43,7 +43,8 @@ The module accepts any valid STS temporary credentials as the password. The JSON
 ```bash
 ROLE=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/)
 CREDS=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/$ROLE)
-PGPASSWORD="$CREDS" psql -h your-pg-host -U dbadmin -d mydb
+PGPASSWORD="$CREDS" PGSSLMODE=verify-full PGSSLROOTCERT=/path/to/ca.crt \
+  psql -h your-pg-host -U dbadmin -d mydb
 ```
 
 ### From IMDSv2 (recommended on EC2)
@@ -52,7 +53,8 @@ PGPASSWORD="$CREDS" psql -h your-pg-host -U dbadmin -d mydb
 TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
 ROLE=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/iam/security-credentials/)
 CREDS=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/iam/security-credentials/$ROLE)
-PGPASSWORD="$CREDS" psql -h your-pg-host -U dbadmin -d mydb
+PGPASSWORD="$CREDS" PGSSLMODE=verify-full PGSSLROOTCERT=/path/to/ca.crt \
+  psql -h your-pg-host -U dbadmin -d mydb
 ```
 
 ### From AWS CLI (any configured profile)
@@ -61,7 +63,8 @@ PGPASSWORD="$CREDS" psql -h your-pg-host -U dbadmin -d mydb
 CREDS=$(aws sts assume-role --role-arn arn:aws:iam::123456789012:role/MyRole \
   --role-session-name pg-session --output json \
   | jq '.Credentials | {AccessKeyId, SecretAccessKey, SessionToken, Expiration}')
-PGPASSWORD="$CREDS" psql -h your-pg-host -U dbadmin -d mydb
+PGPASSWORD="$CREDS" PGSSLMODE=verify-full PGSSLROOTCERT=/path/to/ca.crt \
+  psql -h your-pg-host -U dbadmin -d mydb
 ```
 
 ### From IAM Roles Anywhere + YubiKey (regulated environments)
@@ -75,7 +78,8 @@ CREDS=$(aws_signing_helper credential-process \
   --role-arn "arn:aws:iam::ACCOUNT:role/ROLE_NAME" \
   --pkcs11-lib /path/to/libykcs11.so \
   --certificate "pkcs11:object=X.509%20Certificate%20for%20PIV%20Authentication")
-PGPASSWORD="$CREDS" psql -h your-pg-host -U dbadmin -d mydb
+PGPASSWORD="$CREDS" PGSSLMODE=verify-full PGSSLROOTCERT=/path/to/ca.crt \
+  psql -h your-pg-host -U dbadmin -d mydb
 ```
 
 This binds authentication to a physical hardware token — credentials cannot be extracted or copied.
@@ -118,18 +122,38 @@ Prerequisites: Linux server running PostgreSQL 16+ (compiled with `--with-pam`, 
    CREATE ROLE analyst LOGIN;
    ```
 
-5. **Update `pg_hba.conf`**:
+5. **Enable TLS** in `postgresql.conf`. This is not optional — see [Security](#security):
    ```
-   # Keep trust for superuser
-   local   all   postgres                 trust
-   # PAM for everything else
-   host    all   all        0.0.0.0/0     pam    pamservice=awssts
+   ssl = on
+   ssl_cert_file = 'server.crt'
+   ssl_key_file  = 'server.key'
    ```
 
-6. **Reload PostgreSQL**:
+6. **Update `pg_hba.conf`** (use `hostssl`, never `host`):
+   ```
+   # Keep trust for superuser on the local socket
+   local     all   postgres                  trust
+   # IAM auth over TLS only. Narrow the CIDR to your clients.
+   hostssl   all   all        10.0.0.0/8     pam    pamservice=awssts
+   # Refuse plaintext TCP explicitly so failures are obvious in the log
+   host      all   all        0.0.0.0/0      reject
+   host      all   all        ::/0           reject
+   ```
+
+7. **Reload PostgreSQL**:
    ```bash
    psql -U postgres -c "SELECT pg_reload_conf();"
    ```
+
+8. **Verify plaintext is actually refused** before you hand out credentials. Use
+   a dummy password so nothing real is sent if TLS is not enforced yet:
+   ```bash
+   PGPASSWORD=not-a-credential PGSSLMODE=disable PGGSSENCMODE=disable \
+     psql -h your-pg-host -U dbadmin -d mydb -c 'select 1'
+   ```
+   The error must contain `no encryption`, meaning `pg_hba.conf` refused the
+   connection before PAM ran. If it says `PAM authentication failed` instead,
+   plaintext logins are reaching the module and TLS is **not** enforced.
 
 ## Building
 
@@ -171,11 +195,38 @@ docker compose up -d          # vanilla postgres + rust builder
 
 ## Security
 
+### TLS on the client connection is mandatory
+
+PostgreSQL's PAM authentication [behaves like the `password` method](https://www.postgresql.org/docs/16/auth-pam.html), which
+[sends the password in cleartext](https://www.postgresql.org/docs/16/auth-password.html). With this module the password is a
+live set of AWS STS credentials. On a plaintext connection, anyone on the
+network path captures credentials that work against **every** AWS API your role
+can reach, for the remaining lifetime of the session.
+
+There is no way for a PAM module to detect whether its caller arrived over TLS,
+so this has to be enforced in `pg_hba.conf`:
+
+- Use `hostssl` for every TCP rule. `host` also matches plaintext connections.
+- Add explicit `host ... reject` rules so a misconfiguration fails loudly.
+- Connect with `sslmode=verify-full` and a pinned root certificate. Without
+  `verify-full` a client will hand its credentials to an impostor server.
+
+The shipped `config/pg_hba.conf` is configured this way. Keep it that way.
+
+### Handled by the module
+
 - Credentials (`SecretAccessKey`, `SessionToken`) are zeroized in memory after use
 - No credential caching — every connection validates against STS
-- TLS enforced for STS calls
 - Secrets are never logged
 - Minimal unsafe code — only at the PAM FFI boundary
+
+### Residual risk you are accepting
+
+The database server receives your `SecretAccessKey` and `SessionToken` and can
+therefore act as your IAM principal until the session expires. Anyone able to
+read backend process memory or a core dump on that host can harvest usable AWS
+credentials. Scope the IAM role to the minimum it needs and keep session
+lifetimes short.
 
 ## Project structure
 

@@ -4,7 +4,8 @@ services:
       context: .
       dockerfile: Dockerfile.postgres
     ports:
-      - "5432:5432"
+      # Loopback only: scripts/install.sh trusts the postgres superuser over TCP.
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_DB: testdb
       POSTGRES_USER: postgres
