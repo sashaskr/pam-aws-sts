@@ -82,7 +82,7 @@ This binds authentication to a physical hardware token — credentials cannot be
 
 ## Installation (server side)
 
-Prerequisites: Linux server running PostgreSQL 16+ (compiled with `--with-pam`, which official packages include). PostgreSQL versions below 16 have a 1000-byte password buffer limit which is too small for STS credential JSON.
+Prerequisites: Linux server running PostgreSQL 14+ (compiled with `--with-pam`, which official packages include). Earlier versions cap the password packet at a size too small for STS credential JSON; that [arbitrary limit was removed in PostgreSQL 14](https://www.postgresql.org/message-id/E1kDzIS-0003OC-10@gemulon.postgresql.org).
 
 1. **Copy the module** to your PAM directory:
    ```bash

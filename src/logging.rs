@@ -21,7 +21,19 @@ impl PamLogger {
 
             match syslog::unix(formatter) {
                 Ok(logger) => {
-                    let _ = log::set_boxed_logger(Box::new(BasicLogger::new(logger)));
+                    // A failure here means some other logger is already
+                    // installed in this process, so every auth record this
+                    // module produces would go nowhere. Silently discarding
+                    // the audit trail of an authentication module is not an
+                    // acceptable failure mode, so say so on stderr, which
+                    // PostgreSQL captures into the server log.
+                    if let Err(e) = log::set_boxed_logger(Box::new(BasicLogger::new(logger))) {
+                        eprintln!(
+                            "pam_aws_sts: another logger is already installed, \
+                             auth records may be lost: {}",
+                            e
+                        );
+                    }
                     log::set_max_level(level_filter);
                 }
                 Err(e) => {

@@ -4,7 +4,19 @@ cd "$(dirname "$0")/.."
 
 echo "Copying .so to postgres container..."
 docker compose cp builder:/app/target/release/libpam_aws_sts.so /tmp/libpam_aws_sts.so
-docker compose cp /tmp/libpam_aws_sts.so postgres:/usr/lib/aarch64-linux-gnu/security/pam_aws_sts.so
+
+# The PAM directory is architecture-specific, so ask the container rather than
+# hardcoding one. This used to assume aarch64, which broke the documented dev
+# loop on x86 hosts.
+SECURITY_DIR=$(docker compose exec -T postgres sh -c '
+    for d in /usr/lib/*/security /lib/*/security /usr/lib/security /lib/security; do
+        [ -d "$d" ] && printf "%s" "$d" && exit 0
+    done
+    exit 1
+') || { echo "ERROR: could not locate the PAM module directory in the container" >&2; exit 1; }
+echo "  using ${SECURITY_DIR}"
+
+docker compose cp /tmp/libpam_aws_sts.so "postgres:${SECURITY_DIR}/pam_aws_sts.so"
 rm -f /tmp/libpam_aws_sts.so
 
 echo "Writing /etc/pam.d/awssts..."

@@ -46,8 +46,8 @@ install: release
 	install -m 755 target/release/libpam_aws_sts.so $(INSTALL_DIR)/pam_aws_sts.so
 	install -m 644 config/pam.d/awssts $(CONFIG_DIR)/pam.d/awssts
 	@if [ ! -f $(CONFIG_DIR)/pam_aws_sts.toml ]; then \
-		install -m 600 config/pam_aws_sts.toml $(CONFIG_DIR)/pam_aws_sts.toml; \
-		echo "Installed default config to $(CONFIG_DIR)/pam_aws_sts.toml"; \
+		install -m 600 config/pam_aws_sts.toml.sample $(CONFIG_DIR)/pam_aws_sts.toml; \
+		echo "Installed sample config to $(CONFIG_DIR)/pam_aws_sts.toml - EDIT IT before use"; \
 	else \
 		echo "Config already exists at $(CONFIG_DIR)/pam_aws_sts.toml (not overwritten)"; \
 	fi
@@ -57,7 +57,7 @@ install-linux: build-linux
 	install -m 755 target/$(TARGET_LINUX_X86)/release/libpam_aws_sts.so $(INSTALL_DIR)/pam_aws_sts.so
 	install -m 644 config/pam.d/awssts $(CONFIG_DIR)/pam.d/awssts
 	@if [ ! -f $(CONFIG_DIR)/pam_aws_sts.toml ]; then \
-		install -m 600 config/pam_aws_sts.toml $(CONFIG_DIR)/pam_aws_sts.toml; \
+		install -m 600 config/pam_aws_sts.toml.sample $(CONFIG_DIR)/pam_aws_sts.toml; \
 	fi
 
 # Start Docker containers for integration testing
