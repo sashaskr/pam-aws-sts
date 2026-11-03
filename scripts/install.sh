@@ -28,7 +28,7 @@ docker compose exec -T postgres bash -c '
     cd /var/lib/postgresql/data
     if [ ! -f server.crt ]; then
         openssl req -new -x509 -days 365 -nodes -text \
-            -out server.crt -keyout server.key -subj "/CN=localhost" 2>/dev/null
+            -out server.crt -keyout server.key -subj "/CN=localhost" >/dev/null
     fi
     chmod 600 server.key
     chown postgres:postgres server.key server.crt
@@ -41,6 +41,10 @@ docker compose exec -T postgres bash -c '
     grep -q "^ssl = on" "$conf" || printf "\nssl = on\nssl_cert_file = '"'"'server.crt'"'"'\nssl_key_file = '"'"'server.key'"'"'\n" >> "$conf"
 '
 
+# The superuser trust rule below is reachable over TCP so scripts/test.sh can
+# connect from the host. docker-compose.yml publishes the port on 127.0.0.1
+# only, so nothing off this machine reaches it. Do not widen that, and never
+# copy this rule to a real server.
 echo "Updating pg_hba.conf..."
 docker compose exec -T postgres bash -c 'cat > /var/lib/postgresql/data/pg_hba.conf << EOF
 local     all   postgres                 trust
@@ -54,12 +58,23 @@ echo "Restarting PostgreSQL to pick up TLS..."
 docker compose restart postgres
 docker compose exec -T postgres sh -c 'until pg_isready -q; do sleep 1; done'
 
+# A failed login alone proves nothing: under a plaintext "host ... pam" rule
+# the dummy password is rejected by the module and psql fails too. Assert that
+# pg_hba.conf refused the connection for lack of encryption, before PAM ran.
+# The variables are passed with -e because docker compose exec does not
+# forward the host environment.
 echo "Verifying plaintext connections are refused..."
-if PGSSLMODE=disable docker compose exec -T postgres \
-    psql -h 127.0.0.1 -U dbadmin -d testdb -c 'select 1' >/dev/null 2>&1; then
-    echo "ERROR: a plaintext connection succeeded; pg_hba.conf is not enforcing TLS" >&2
+plain_rc=0
+plain_out=$(docker compose exec -T \
+    -e PGSSLMODE=disable -e PGGSSENCMODE=disable -e PGPASSWORD=not-a-credential \
+    postgres psql -h 127.0.0.1 -U dbadmin -d testdb -c 'select 1' 2>&1) || plain_rc=$?
+if [ "$plain_rc" -eq 0 ] \
+    || ! grep -q 'no encryption' <<<"$plain_out" \
+    || grep -q 'PAM authentication failed' <<<"$plain_out"; then
+    echo "ERROR: pg_hba.conf is not enforcing TLS. psql said:" >&2
+    echo "$plain_out" >&2
     exit 1
 fi
-echo "  plaintext refused as expected"
+echo "  plaintext refused by pg_hba.conf as expected"
 
 echo "Done. PAM is active over TLS."

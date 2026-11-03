@@ -35,7 +35,7 @@ test_distro() {
     echo "=============================="
 
     docker rm -f "$NAME" 2>/dev/null || true
-    docker run -d --name "$NAME" -p 5432:5432 "$IMAGE" sleep infinity
+    docker run -d --name "$NAME" -p 127.0.0.1:5432:5432 "$IMAGE" sleep infinity
 
     echo "Installing PostgreSQL..."
     docker exec "$NAME" bash -c "$PG_PKG"
@@ -86,7 +86,7 @@ CONF
         if [ ! -f "$PG_DATA/server.crt" ]; then
             openssl req -new -x509 -days 365 -nodes -text \
                 -out "$PG_DATA/server.crt" -keyout "$PG_DATA/server.key" \
-                -subj "/CN=localhost" 2>/dev/null
+                -subj "/CN=localhost" >/dev/null
         fi
         chmod 600 "$PG_DATA/server.key"
         chown postgres:postgres "$PG_DATA/server.key" "$PG_DATA/server.crt"
@@ -105,15 +105,24 @@ EOF
     '
     sleep 3
 
-    echo "Testing plaintext connection is refused (should fail)..."
-    if PGSSLMODE=disable PGPASSWORD="garbage" \
-        psql -h localhost -p 5432 -U dbadmin -d testdb -c "SELECT 1" >/dev/null 2>&1; then
-        echo "  FAIL: plaintext connection was accepted"
+    # A failed login alone proves nothing: under a plaintext "host ... pam"
+    # rule the dummy password is rejected by the module and psql fails too.
+    # Require pg_hba.conf's own "no encryption" refusal, before PAM runs.
+    echo "Testing plaintext connection is refused by pg_hba.conf (should fail)..."
+    local plain_rc=0 plain_out
+    plain_out=$(PGSSLMODE=disable PGGSSENCMODE=disable PGPASSWORD="not-a-credential" \
+        psql -h localhost -p 5432 -U dbadmin -d testdb -c "SELECT 1" 2>&1) || plain_rc=$?
+    if [ "$plain_rc" -eq 0 ] \
+        || ! grep -q 'no encryption' <<<"$plain_out" \
+        || grep -q 'PAM authentication failed' <<<"$plain_out"; then
+        echo "  FAIL: pg_hba.conf is not enforcing TLS. psql said:"
+        echo "$plain_out"
         return 1
-    else
-        echo "  PASS: plaintext refused"
     fi
+    echo "  PASS: plaintext refused by pg_hba.conf"
 
+    # "require" suits the throwaway self-signed localhost cert used here. Real
+    # clients must use verify-full with a pinned root (see README, Security).
     echo "Testing garbage password over TLS (should fail)..."
     if PGSSLMODE=require PGPASSWORD="garbage" \
         psql -h localhost -p 5432 -U dbadmin -d testdb -c "SELECT 1" 2>/dev/null; then
@@ -138,12 +147,12 @@ EOF
 
 # --- Amazon Linux 2023 ---
 test_distro "al2023-pg" "amazonlinux:2023" "pam_aws_sts-al2023-amd64" "/usr/lib64/security" \
-    "dnf install -y postgresql16-server postgresql16 pam" \
+    "dnf install -y postgresql16-server postgresql16 pam openssl" \
     "postgresql-setup --initdb && su - postgres -c 'pg_ctl start -D /var/lib/pgsql/data -l /tmp/pg.log' && sleep 2"
 
 # --- Rocky Linux 9 ---
 test_distro "el9-pg" "rockylinux:9" "pam_aws_sts-el9-amd64" "/usr/lib64/security" \
-    "dnf install -y postgresql-server postgresql pam" \
+    "dnf install -y postgresql-server postgresql pam openssl" \
     "postgresql-setup --initdb && su - postgres -c 'pg_ctl start -D /var/lib/pgsql/data -l /tmp/pg.log' && sleep 2"
 
 echo ""

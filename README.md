@@ -145,11 +145,15 @@ Prerequisites: Linux server running PostgreSQL 16+ (compiled with `--with-pam`, 
    psql -U postgres -c "SELECT pg_reload_conf();"
    ```
 
-8. **Verify plaintext is actually refused** before you hand out credentials:
+8. **Verify plaintext is actually refused** before you hand out credentials. Use
+   a dummy password so nothing real is sent if TLS is not enforced yet:
    ```bash
-   # Must fail:
-   PGSSLMODE=disable psql -h your-pg-host -U dbadmin -d mydb -c 'select 1'
+   PGPASSWORD=not-a-credential PGSSLMODE=disable PGGSSENCMODE=disable \
+     psql -h your-pg-host -U dbadmin -d mydb -c 'select 1'
    ```
+   The error must contain `no encryption`, meaning `pg_hba.conf` refused the
+   connection before PAM ran. If it says `PAM authentication failed` instead,
+   plaintext logins are reaching the module and TLS is **not** enforced.
 
 ## Building
 

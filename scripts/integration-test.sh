@@ -1,13 +1,17 @@
 #!/bin/bash
 # integration-test.sh — Run end-to-end tests against Docker environment
 #
-# Prerequisites: docker compose up (postgres + mock-sts running)
+# Prerequisites: docker compose up, then scripts/build.sh and
+# scripts/install.sh. install.sh enables TLS on the server; this script does no
+# TLS setup itself, and every test fails against a server without it.
 #
 # Tests:
-# 1. Valid mock credentials → should authenticate via mock STS
-# 2. Garbage password → should be rejected
-# 3. Malformed JSON → should be rejected
-# 4. Wrong username for the role → should be rejected
+# 0. Plaintext connection → refused by pg_hba.conf before PAM runs
+# 1. Garbage password → should be rejected
+# 2. Empty password → should be rejected
+# 3. Expired credentials → should be rejected
+# 4. Mock credentials → should reach STS validation
+# 5. Nonexistent PostgreSQL user → should be rejected
 
 set -euo pipefail
 
@@ -18,8 +22,8 @@ NC='\033[0m'
 PASS=0
 FAIL=0
 
-pass() { echo -e "${GREEN}PASS${NC}: $1"; ((PASS++)); }
-fail() { echo -e "${RED}FAIL${NC}: $1 — $2"; ((FAIL++)); }
+pass() { echo -e "${GREEN}PASS${NC}: $1"; PASS=$((PASS + 1)); }
+fail() { echo -e "${RED}FAIL${NC}: $1 — $2"; FAIL=$((FAIL + 1)); }
 
 PG_HOST="${PG_HOST:-localhost}"
 PG_PORT="${PG_PORT:-5432}"
@@ -27,6 +31,8 @@ PG_PORT="${PG_PORT:-5432}"
 # PAM sends the password in cleartext, and here the password is a live set of
 # STS credentials. Every test below must therefore run over TLS; a plaintext
 # attempt is asserted to fail in Test 0.
+# "require" is enough against the dev server's self-signed localhost cert. Real
+# clients must use verify-full with a pinned root (see README, Security).
 export PGSSLMODE=require
 
 echo "=== pam_aws_sts Integration Tests ==="
@@ -51,13 +57,21 @@ echo ""
 
 # --- Test 0: Plaintext connections must be refused ---
 # This guards the property that makes every other test safe: credentials must
-# never be transmittable in the clear.
+# never be transmittable in the clear. A failed login is not enough: under a
+# plaintext "host ... pam" rule the dummy password is rejected by the module
+# and psql fails anyway. Require pg_hba.conf's own "no encryption" refusal.
 echo "Test 0: Plaintext connection refused"
-if PGSSLMODE=disable PGPASSWORD="anything" \
-    psql -h "$PG_HOST" -p "$PG_PORT" -U pg_admin -d testdb -c "SELECT 1" >/dev/null 2>&1; then
+plain_rc=0
+plain_out=$(PGSSLMODE=disable PGGSSENCMODE=disable PGPASSWORD="not-a-credential" \
+    psql -h "$PG_HOST" -p "$PG_PORT" -U pg_admin -d testdb -c "SELECT 1" 2>&1) || plain_rc=$?
+if [ "$plain_rc" -eq 0 ]; then
     fail "Plaintext connection" "accepted a non-TLS connection; pg_hba.conf must use hostssl"
+elif grep -q 'PAM authentication failed' <<<"$plain_out"; then
+    fail "Plaintext connection" "reached PAM over plaintext; pg_hba.conf must use hostssl"
+elif ! grep -q 'no encryption' <<<"$plain_out"; then
+    fail "Plaintext connection" "unexpected error, not a pg_hba.conf TLS refusal: ${plain_out}"
 else
-    pass "Plaintext connection refused"
+    pass "Plaintext connection refused by pg_hba.conf"
 fi
 
 # --- Test 1: Garbage password should fail ---
